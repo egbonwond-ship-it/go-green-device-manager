@@ -1,6 +1,7 @@
 // Where agent data is kept.
-// - COSMOS_CONNECTION_STRING set: Azure Cosmos DB (free tier: 1000 RU/s and 25 GB at no cost).
-// - Not set: in memory, which is lost when the API restarts. Fine for local runs and tests.
+// - SQL_CONNECTION_STRING set: Azure SQL Database (free offer: 100,000 vCore seconds and 32 GB a month).
+// - COSMOS_CONNECTION_STRING set: Azure Cosmos DB (free tier: 1000 RU/s and 25 GB).
+// - Neither: in memory, which is lost when the API restarts. Fine for local runs and tests.
 const DB = process.env.COSMOS_DATABASE || 'ggt-devices';
 const MAX_STATUSES = 5000;
 
@@ -58,8 +59,66 @@ function cosmosStore(conn) {
   };
 }
 
+function sqlStore(conn) {
+  const sql = require('mssql');
+  let poolP = null;
+  // The free database pauses when idle; the first connection after a pause can take up to a minute
+  // or fail with error 40613 while it resumes, so allow a long connect and retry.
+  const pool = () => (poolP ??= new sql.ConnectionPool(conn.includes('Connection Timeout') ? conn : `${conn.replace(/;?$/, ';')}Connection Timeout=60`)
+    .connect().then(async p => {
+      await p.request().batch(`
+IF OBJECT_ID('dbo.devices') IS NULL CREATE TABLE dbo.devices (
+  id NVARCHAR(64) NOT NULL PRIMARY KEY, name NVARCHAR(64) NOT NULL, platform NVARCHAR(16) NOT NULL,
+  last_seen DATETIME2 NOT NULL, doc NVARCHAR(MAX) NOT NULL);
+IF OBJECT_ID('dbo.deployment_status') IS NULL CREATE TABLE dbo.deployment_status (
+  id BIGINT IDENTITY(1,1) PRIMARY KEY, device_id NVARCHAR(64) NOT NULL, deployment_id NVARCHAR(64) NOT NULL,
+  state NVARCHAR(16) NOT NULL, error_code NVARCHAR(20) NULL, at DATETIME2 NOT NULL,
+  INDEX ix_status_device (device_id, at));`);
+      return p;
+    })
+    .catch(e => { poolP = null; throw e; }));
+  const q = async (text, params = {}, tries = 3) => {
+    try {
+      const req = (await pool()).request();
+      for (const [k, [type, v]] of Object.entries(params)) req.input(k, type, v);
+      return (await req.query(text)).recordset || [];
+    } catch (e) {
+      const transient = [40613, 40197, 40501, 49918, 49919, 49920].includes(e.number) || e.code === 'ETIMEOUT' || e.code === 'ESOCKET';
+      if (transient && tries > 1) { poolP = null; await new Promise(r => setTimeout(r, 5000)); return q(text, params, tries - 1); }
+      throw e;
+    }
+  };
+  const S = v => [sql.NVarChar(sql.MAX), v];
+  const toStatus = r => ({ deviceId: r.device_id, deploymentId: r.deployment_id, state: r.state, errorCode: r.error_code, at: new Date(r.at).toISOString() });
+  return {
+    kind: 'azure-sql',
+    async getDevice(id) { const r = await q('SELECT doc FROM dbo.devices WHERE id = @id', { id: S(id) }); return r[0] ? JSON.parse(r[0].doc) : null; },
+    async upsertDevice(d) {
+      await q(`MERGE dbo.devices WITH (HOLDLOCK) AS t USING (SELECT @id AS id) AS s ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET name = @name, platform = @platform, last_seen = @seen, doc = @doc
+        WHEN NOT MATCHED THEN INSERT (id, name, platform, last_seen, doc) VALUES (@id, @name, @platform, @seen, @doc);`,
+      { id: S(d.id), name: S(d.name), platform: S(d.platform), seen: [sql.DateTime2, new Date(d.lastSeen)], doc: S(JSON.stringify(d)) });
+      return d;
+    },
+    async listDevices() { return (await q('SELECT TOP 1000 doc FROM dbo.devices ORDER BY last_seen DESC')).map(r => JSON.parse(r.doc)); },
+    async countDevices() { return (await q('SELECT COUNT(*) AS n FROM dbo.devices'))[0].n; },
+    async addStatus(s) {
+      await q('INSERT INTO dbo.deployment_status (device_id, deployment_id, state, error_code, at) VALUES (@d, @dep, @st, @err, @at)',
+        { d: S(s.deviceId), dep: S(s.deploymentId), st: S(s.state), err: S(s.errorCode), at: [sql.DateTime2, new Date(s.at)] });
+    },
+    async listStatuses(deviceId) {
+      const r = deviceId
+        ? await q('SELECT TOP 500 * FROM dbo.deployment_status WHERE device_id = @d ORDER BY at DESC', { d: S(deviceId) })
+        : await q('SELECT TOP 500 * FROM dbo.deployment_status ORDER BY at DESC');
+      return r.map(toStatus);
+    },
+  };
+}
+
 function createStore(env = process.env) {
-  return env.COSMOS_CONNECTION_STRING ? cosmosStore(env.COSMOS_CONNECTION_STRING) : memoryStore();
+  if (env.SQL_CONNECTION_STRING) return sqlStore(env.SQL_CONNECTION_STRING);
+  if (env.COSMOS_CONNECTION_STRING) return cosmosStore(env.COSMOS_CONNECTION_STRING);
+  return memoryStore();
 }
 
 module.exports = { createStore, memoryStore };

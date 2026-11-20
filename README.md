@@ -46,13 +46,14 @@ To use the real Azure Functions runtime instead: `npm i -g @azure/static-web-app
 3. In GitHub → this repo → **Settings → Secrets and variables → Actions**, add `AZURE_STATIC_WEB_APPS_API_TOKEN` with that token.
 4. Push to `main` (or run the workflow manually). `.github/workflows/azure-static-web-apps.yml` runs the tests and deploys `app/` and `api/`. Pull requests get their own staging URL.
 5. In the Static Web App → **Environment variables**, set `AGENT_ENROLL_TOKEN` to a long random value. Agents must send it in the `x-ggt-enroll-token` header. Without it the API accepts only `demo-token`.
-6. **Database (free).** Create an Azure Cosmos DB for NoSQL account with the free tier on (one per subscription: 1000 RU/s and 25 GB free), then set `COSMOS_CONNECTION_STRING` on the Static Web App:
+6. **Database (free).** Create an Azure SQL Database with the **free offer** (100,000 vCore seconds and 32 GB a month, set to pause when the free amount is used so it never bills), then set `SQL_CONNECTION_STRING` on the Static Web App:
    ```bash
-   az cosmosdb create -n <account> -g go-green-rg --enable-free-tier true --default-consistency-level Session --locations regionName=eastus2
-   az cosmosdb keys list -n <account> -g go-green-rg --type connection-strings --query "connectionStrings[0].connectionString" -o tsv
-   az staticwebapp appsettings set -n go-green-device-manager --setting-names COSMOS_CONNECTION_STRING="<that value>"
+   az sql server create -n <server> -g go-green-rg -l eastus2 --enable-ad-only-auth false -u ggtadmin -p '<strong password>'
+   az sql server firewall-rule create -s <server> -g go-green-rg -n AllowAzureServices --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0
+   az sql db create -s <server> -g go-green-rg -n ggt-devices --edition GeneralPurpose --compute-model Serverless --family Gen5 --capacity 2 --use-free-limit --free-limit-exhaustion-behavior AutoPause
+   az staticwebapp appsettings set -n go-green-device-manager --setting-names SQL_CONNECTION_STRING="Server=tcp:<server>.database.windows.net,1433;Database=ggt-devices;User ID=ggtadmin;Password=<password>;Encrypt=true"
    ```
-   The API creates the `ggt-devices` database (1000 RU/s shared, inside the free allowance) and its `devices` and `statuses` containers on first use. Deployment results expire after 90 days. Without the setting, data is kept in memory and lost on restart. `/api/health` shows which one is in use.
+   The API creates its `devices` and `deployment_status` tables on first use. The free database pauses when idle, so the first check-in after a quiet spell can take up to a minute. Azure Cosmos DB also works (`COSMOS_CONNECTION_STRING`, free tier). Without either setting, data is kept in memory and lost on restart. `/api/health` shows which storage is in use.
 
 `app/staticwebapp.config.json` sets the SPA fallback, Node 20 for the API, security headers (CSP, no framing), and restricts `GET /api/devices` to signed-in users. Add a custom domain under **Custom domains**.
 
@@ -80,7 +81,7 @@ The console and the API contract are ready; these pieces replace the simulation 
 1. **Device agent.** A small service on every device that checks in every 5 minutes, sends inventory, pulls policy, installs software, applies updates, evaluates baselines and reports results. Options:
    - Build it: a .NET Worker Service for Windows (WMI/CIM for inventory, Windows Update Agent API or `UsoClient` for patches, `msiexec`/winget for installs), a launchd daemon for macOS, a systemd service for Linux (`apt`, `unattended-upgrades`).
    - Or lean on Microsoft's agents and use this console as the Go-Green front end: **Microsoft Intune** (Graph API for devices, apps, compliance), **Azure Update Manager** + **Azure Arc** for servers, **Microsoft Defender for Endpoint** for security signals. This is usually faster and cheaper than writing an agent.
-2. **Database.** Agent data is saved in **Azure Cosmos DB** (`api/src/lib/storage.js`). Next step: add console endpoints for collections and deployments and point the frontend at the API instead of `store.js`'s simulator; the data shapes already match.
+2. **Database.** Agent data is saved in **Azure SQL** or **Azure Cosmos DB** (`api/src/lib/storage.js`). Next step: add console endpoints for collections and deployments and point the frontend at the API instead of `store.js`'s simulator; the data shapes already match.
 3. **Content storage.** Installers in **Azure Blob Storage**, served to devices through short-lived SAS URLs, with **Azure Front Door** or a cache server per site as the "distribution point" for slow links.
 4. **Background jobs.** Collection membership, ADR schedules, deadline enforcement and alerting run as timer-triggered functions. Static Web Apps' managed API supports HTTP triggers only, so use a separate **Azure Functions app** (linked via "Bring your own functions", Standard plan) or Azure Container Apps jobs.
 5. **Real-time updates.** **Azure Web PubSub** or SignalR Service to push check-ins and alerts to the console, and to send "act now" notifications to agents.
@@ -101,7 +102,7 @@ app/                     Static frontend (deployed as-is)
   js/store.js            State, rules, compliance, deployments, live simulation
   js/ui.js               Tables, modals, drawers, charts
   js/views/*.js          One file per page
-api/                     Azure Functions API (agent check-in, policy, status; Cosmos DB storage)
+api/                     Azure Functions API (agent check-in, policy, status; Azure SQL / Cosmos DB storage)
 dev-server.js            Local server for app + API
 scripts/smoke-test.js    CI tests
 .github/workflows/       Test + deploy to Azure Static Web Apps
