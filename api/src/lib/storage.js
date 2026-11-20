@@ -1,4 +1,5 @@
 // Where agent data is kept.
+// - POSTGRES_URL set: PostgreSQL, e.g. a free Supabase project (use its connection pooler URL).
 // - SQL_CONNECTION_STRING set: Azure SQL Database (free offer: 100,000 vCore seconds and 32 GB a month).
 // - COSMOS_CONNECTION_STRING set: Azure Cosmos DB (free tier: 1000 RU/s and 25 GB).
 // - Neither: in memory, which is lost when the API restarts. Fine for local runs and tests.
@@ -115,7 +116,43 @@ IF OBJECT_ID('dbo.deployment_status') IS NULL CREATE TABLE dbo.deployment_status
   };
 }
 
+function pgStore(url) {
+  const { Pool } = require('pg');
+  const ssl = /localhost|127\.0\.0\.1/.test(url) || /sslmode=disable/.test(url) ? false : { rejectUnauthorized: false };
+  const pool = new Pool({ connectionString: url.replace(/[?&]sslmode=[^&]*/, ''), ssl, max: 3, idleTimeoutMillis: 10000, connectionTimeoutMillis: 15000 });
+  let ready = null;
+  // Own schema, not "public": Supabase's auto-generated REST API only exposes "public",
+  // so device data can't be read with the project's anon key.
+  const init = () => (ready ??= pool.query(`
+CREATE SCHEMA IF NOT EXISTS ggt;
+CREATE TABLE IF NOT EXISTS ggt.devices (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL, last_seen TIMESTAMPTZ NOT NULL, doc JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS ggt.deployment_status (
+  id BIGSERIAL PRIMARY KEY, device_id TEXT NOT NULL, deployment_id TEXT NOT NULL, state TEXT NOT NULL, error_code TEXT, at TIMESTAMPTZ NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_status_device ON ggt.deployment_status (device_id, at DESC);`).catch(e => { ready = null; throw e; }));
+  const q = async (text, params) => { await init(); return (await pool.query(text, params)).rows; };
+  const toStatus = r => ({ deviceId: r.device_id, deploymentId: r.deployment_id, state: r.state, errorCode: r.error_code, at: new Date(r.at).toISOString() });
+  return {
+    kind: 'postgres',
+    async getDevice(id) { const r = await q('SELECT doc FROM ggt.devices WHERE id = $1', [id]); return r[0] ? r[0].doc : null; },
+    async upsertDevice(d) {
+      await q(`INSERT INTO ggt.devices (id, name, platform, last_seen, doc) VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, platform = EXCLUDED.platform, last_seen = EXCLUDED.last_seen, doc = EXCLUDED.doc`,
+      [d.id, d.name, d.platform, d.lastSeen, JSON.stringify(d)]);
+      return d;
+    },
+    async listDevices() { return (await q('SELECT doc FROM ggt.devices ORDER BY last_seen DESC LIMIT 1000')).map(r => r.doc); },
+    async countDevices() { return Number((await q('SELECT COUNT(*)::int AS n FROM ggt.devices'))[0].n); },
+    async addStatus(s) { await q('INSERT INTO ggt.deployment_status (device_id, deployment_id, state, error_code, at) VALUES ($1, $2, $3, $4, $5)', [s.deviceId, s.deploymentId, s.state, s.errorCode, s.at]); },
+    async listStatuses(deviceId) {
+      const r = deviceId ? await q('SELECT * FROM ggt.deployment_status WHERE device_id = $1 ORDER BY at DESC LIMIT 500', [deviceId]) : await q('SELECT * FROM ggt.deployment_status ORDER BY at DESC LIMIT 500');
+      return r.map(toStatus);
+    },
+  };
+}
+
 function createStore(env = process.env) {
+  if (env.POSTGRES_URL) return pgStore(env.POSTGRES_URL);
   if (env.SQL_CONNECTION_STRING) return sqlStore(env.SQL_CONNECTION_STRING);
   if (env.COSMOS_CONNECTION_STRING) return cosmosStore(env.COSMOS_CONNECTION_STRING);
   return memoryStore();
