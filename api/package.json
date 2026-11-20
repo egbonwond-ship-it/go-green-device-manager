@@ -1,0 +1,10 @@
+{
+  "name": "go-green-device-manager-api",
+  "version": "1.0.0",
+  "description": "Go-Green Device Manager agent API (Azure Functions, Node v4 model)",
+  "main": "src/functions/*.js",
+  "private": true,
+  "scripts": { "start": "func start" },
+  "dependencies": { "@azure/functions": "^4.7.0" },
+  "engines": { "node": ">=20" }
+}

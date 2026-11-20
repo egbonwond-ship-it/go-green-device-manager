@@ -1,0 +1,57 @@
+# Deploys go-green-device-manager to Azure Static Web Apps (frontend in /app, Azure Functions API in /api).
+# Add the Static Web App's deployment token as the repository secret AZURE_STATIC_WEB_APPS_API_TOKEN
+# (Azure portal > your Static Web App > Overview > Manage deployment token). Until then, tests run and the upload is skipped.
+name: Deploy go-green-device-manager
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm --prefix api install --omit=dev
+      - run: npm test
+
+  build_and_deploy:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: test
+    runs-on: ubuntu-latest
+    name: Build and deploy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Azure Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: app
+          api_location: api
+          output_location: ""
+          skip_app_build: true
+          skip_deploy_on_missing_secrets: true
+
+  close_pull_request:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    name: Close staging environment
+    steps:
+      - uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          action: close
+          skip_deploy_on_missing_secrets: true

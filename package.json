@@ -1,0 +1,12 @@
+{
+  "name": "go-green-device-manager",
+  "version": "1.0.0",
+  "description": "Go-Green Technologies device management console - Azure Static Web App",
+  "private": true,
+  "scripts": {
+    "start": "node dev-server.js",
+    "swa": "swa start app --api-location api",
+    "test": "node scripts/smoke-test.js"
+  },
+  "engines": { "node": ">=20" }
+}
