@@ -1,6 +1,6 @@
 # Deploys go-green-device-manager to Azure Static Web Apps (frontend in /app, Azure Functions API in /api).
 # Add the Static Web App's deployment token as the repository secret AZURE_STATIC_WEB_APPS_API_TOKEN
-# (Azure portal > your Static Web App > Overview > Manage deployment token). Until then, tests run and the upload is skipped.
+# (Azure portal > your Static Web App > Overview > Manage deployment token). Until then, tests run and the upload is skipped with a notice.
 name: Deploy go-green-device-manager
 
 on:
@@ -20,8 +20,8 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with: { node-version: 20 }
       - run: npm --prefix api install --omit=dev
       - run: npm test
@@ -31,9 +31,16 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     name: Build and deploy
+    env:
+      HAS_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Deployment token missing
+        if: env.HAS_TOKEN != 'true'
+        run: echo "::notice::Add the AZURE_STATIC_WEB_APPS_API_TOKEN repository secret to deploy. Tests passed; upload skipped."
+      - uses: actions/checkout@v5
+        if: env.HAS_TOKEN == 'true'
       - name: Deploy to Azure Static Web Apps
+        if: env.HAS_TOKEN == 'true'
         uses: Azure/static-web-apps-deploy@v1
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
@@ -43,15 +50,16 @@ jobs:
           api_location: api
           output_location: ""
           skip_app_build: true
-          skip_deploy_on_missing_secrets: true
 
   close_pull_request:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
     name: Close staging environment
+    env:
+      HAS_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN != '' }}
     steps:
       - uses: Azure/static-web-apps-deploy@v1
+        if: env.HAS_TOKEN == 'true'
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
           action: close
-          skip_deploy_on_missing_secrets: true
