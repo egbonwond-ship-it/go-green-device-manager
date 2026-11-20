@@ -2,12 +2,14 @@
 // health endpoint for the console. Pure function so it runs under Azure Functions
 // (src/functions/api.js) and the local dev server (dev-server.js) alike.
 //
-// Storage is in memory here so the repo deploys with zero setup. For production,
-// swap the `store` object for Azure Cosmos DB or Azure SQL (see README).
+// Data is saved in Azure Cosmos DB when COSMOS_CONNECTION_STRING is set, otherwise in memory (lib/storage.js).
 const crypto = require('crypto');
+const { createStore } = require('./storage');
 
-const VERSION = '1.0.0';
-const store = { devices: new Map(), statuses: [], checkins: 0, started: new Date().toISOString() };
+const VERSION = '1.1.0';
+let db = createStore();
+const stats = { checkins: 0, started: new Date().toISOString() };
+const useStore = s => { db = s; };
 
 // Policy the agent pulls: what to install, which updates to apply, which baselines to evaluate.
 // In production this is computed from collections + deployments in the database.
@@ -45,10 +47,12 @@ function validateCheckin(b) {
   return errors;
 }
 
-async function handle({ method, path, query = {}, body = {}, headers = {} }) {
+async function route_({ method, path, query = {}, body = {}, headers = {} }) {
   const route = `${method} ${path.replace(/\/+$/, '')}`;
   if (route === 'GET /api/health') {
-    return { status: 200, body: { status: 'ok', version: VERSION, agentsCheckedIn: store.checkins, devicesKnown: store.devices.size, since: store.started, storage: 'memory' } };
+    let devicesKnown = null, storageOk = true;
+    try { devicesKnown = await db.countDevices(); } catch (e) { storageOk = false; console.error('storage', e.message); }
+    return { status: storageOk ? 200 : 503, body: { status: storageOk ? 'ok' : 'storage-unavailable', version: VERSION, agentsCheckedIn: stats.checkins, devicesKnown, since: stats.started, storage: db.kind } };
   }
   if (path.startsWith('/api/agent/')) {
     if (!tokenOk(headers)) return { status: 401, body: { error: 'Missing or invalid x-ggt-enroll-token header' } };
@@ -56,33 +60,41 @@ async function handle({ method, path, query = {}, body = {}, headers = {} }) {
       const errors = validateCheckin(body || {});
       if (errors.length) return { status: 400, body: { error: 'Invalid check-in', details: errors } };
       const id = str(body.deviceId, 64) ? body.deviceId : crypto.randomUUID();
-      store.devices.set(id, {
-        deviceId: id, name: body.name, platform: body.platform, os: body.os, hardware: body.hardware || {},
+      const prev = await db.getDevice(id);
+      await db.upsertDevice({
+        id, deviceId: id, enrolled: prev?.enrolled || new Date().toISOString(), name: body.name, platform: body.platform, os: body.os, hardware: body.hardware || {},
         software: (body.software || []).slice(0, 2000), updates: body.updates || {}, compliance: body.compliance || {},
         lastSeen: new Date().toISOString(),
       });
-      store.checkins++;
+      stats.checkins++;
       return { status: 200, body: { deviceId: id, nextCheckInSec: DEMO_POLICY.pollIntervalSec, policyUrl: `/api/agent/policy?deviceId=${encodeURIComponent(id)}` } };
     }
     if (route === 'GET /api/agent/policy') {
-      if (!store.devices.has(query.deviceId)) return { status: 404, body: { error: 'Unknown device. Check in first.' } };
+      if (!str(query.deviceId, 64) || !(await db.getDevice(query.deviceId))) return { status: 404, body: { error: 'Unknown device. Check in first.' } };
       return { status: 200, body: { deviceId: query.deviceId, issued: new Date().toISOString(), ...DEMO_POLICY } };
     }
     if (route === 'POST /api/agent/status') {
       const b = body || {};
-      if (!store.devices.has(b.deviceId)) return { status: 404, body: { error: 'Unknown device' } };
+      if (!str(b.deviceId, 64) || !(await db.getDevice(b.deviceId))) return { status: 404, body: { error: 'Unknown device' } };
       if (!str(b.deploymentId, 64) || !['success', 'inprogress', 'error', 'reqnotmet'].includes(b.state)) return { status: 400, body: { error: 'deploymentId and state (success|inprogress|error|reqnotmet) are required' } };
-      store.statuses.push({ deviceId: b.deviceId, deploymentId: b.deploymentId, state: b.state, errorCode: str(b.errorCode, 20) ? b.errorCode : null, at: new Date().toISOString() });
-      if (store.statuses.length > 5000) store.statuses.shift();
+      await db.addStatus({ deviceId: b.deviceId, deploymentId: b.deploymentId, state: b.state, errorCode: str(b.errorCode, 20) ? b.errorCode : null, at: new Date().toISOString() });
       return { status: 202, body: { accepted: true } };
     }
     return { status: 404, body: { error: 'Not found' } };
   }
   if (route === 'GET /api/devices') {
     // Protected by staticwebapp.config.json (authenticated users only).
-    return { status: 200, body: { devices: [...store.devices.values()].map(({ software, ...d }) => ({ ...d, softwareCount: software.length })) } };
+    const devices = await db.listDevices();
+    return { status: 200, body: { storage: db.kind, devices: devices.map(({ software = [], ...d }) => ({ ...d, softwareCount: software.length })) } };
   }
   return { status: 404, body: { error: 'Not found' } };
 }
 
-module.exports = { handle, _store: store };
+async function handle(req) {
+  try { return await route_(req); } catch (e) {
+    console.error('api error', e && e.message);
+    return { status: 503, body: { error: 'The device database is unavailable. The agent should retry later.' } };
+  }
+}
+
+module.exports = { handle, useStore, _db: () => db };

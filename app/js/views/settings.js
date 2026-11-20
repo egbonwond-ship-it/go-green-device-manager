@@ -33,6 +33,7 @@ export default function settings(el) {
   el.querySelector('#sim').addEventListener('change', e => { S.state.settings.simulate = e.target.checked; S.save(); S.emit(); });
   el.querySelector('#reset').addEventListener('click', () => confirmBox('Reset demo data?', 'This regenerates the demo estate and removes every deployment, collection and change you made in this browser.', 'Reset', () => { S.reset(); toast('Demo data reset'); location.hash = '#/overview'; }, true));
   fetch('/api/health').then(r => r.ok ? r.json() : Promise.reject(r.status)).then(j => {
-    el.querySelector('#api').innerHTML = `${badge('Connected', 'good')} Azure Functions API ${esc(j.version)} · ${j.agentsCheckedIn} agent check-ins received since start. The console still uses the simulated estate; see the README for wiring it to the database.`;
+    const where = j.storage === 'cosmos' ? 'saved in Azure Cosmos DB' : 'kept in memory only (lost on restart)';
+    el.querySelector('#api').innerHTML = `${badge('Connected', 'good')} Azure Functions API ${esc(j.version)} · ${esc(j.devicesKnown ?? 0)} enrolled agent${j.devicesKnown === 1 ? '' : 's'}, ${where}. The console screens still show the simulated estate.`;
   }).catch(() => { el.querySelector('#api').innerHTML = `${badge('Not deployed', 'neutral')} The API runs when the app is deployed to Azure Static Web Apps or started with <span class="mono">swa start</span>.`; });
 }

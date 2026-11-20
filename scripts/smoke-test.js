@@ -3,7 +3,7 @@
 const assert = require('assert/strict');
 const path = require('path');
 const { pathToFileURL } = require('url');
-const { handle, _store } = require('../api/src/lib/router');
+const { handle, _db } = require('../api/src/lib/router');
 
 (async () => {
   // Front-end engine (ES modules) in Node with a stub localStorage.
@@ -37,6 +37,16 @@ const { handle, _store } = require('../api/src/lib/router');
   r = await handle({ method: 'GET', path: '/api/agent/policy', query: { deviceId: id }, headers: H });
   assert.equal(r.status, 200); assert.ok(r.body.deployments.length);
   r = await handle({ method: 'POST', path: '/api/agent/status', headers: H, body: { deviceId: id, deploymentId: 'dep-forti', state: 'success' } });
-  assert.equal(r.status, 202); assert.equal(_store.statuses.length, 1);
-  console.log('✓ api: health, token check, validation, check-in, policy, status');
+  assert.equal(r.status, 202); assert.equal((await _db().listStatuses(id)).length, 1);
+  r = await handle({ method: 'POST', path: '/api/agent/checkin', headers: H, body: { deviceId: id, name: 'GGT-LAG-LT999', platform: 'Windows', os: 'Windows 11 24H2' } });
+  assert.equal(r.body.deviceId, id, 're-check-in keeps the same device');
+  r = await handle({ method: 'GET', path: '/api/devices' });
+  assert.equal(r.body.devices.length, 1); assert.equal(r.body.storage, 'memory');
+  console.log('✓ api: health, token check, validation, check-in, policy, status, device list');
+  // Storage failures become a 503 instead of crashing the function.
+  const { useStore } = require('../api/src/lib/router');
+  useStore({ kind: 'broken', countDevices: async () => { throw new Error('down'); }, getDevice: async () => { throw new Error('down'); } });
+  r = await handle({ method: 'GET', path: '/api/health' }); assert.equal(r.status, 503);
+  r = await handle({ method: 'GET', path: '/api/agent/policy', query: { deviceId: id }, headers: H }); assert.equal(r.status, 503);
+  console.log('✓ api: storage outage handled');
 })().catch(e => { console.error(e); process.exit(1); });
