@@ -64,7 +64,7 @@ export async function enrolHelp() {
     <div class="console">${esc(winCmd)}</div><div class="actions" style="margin-top:6px"><button class="btn" id="cp-win">Copy command</button></div>
     <h3 style="margin:14px 0 6px">macOS and Linux</h3>
     <div class="actions" style="margin:6px 0">${dl('dl-nix', 'Download macOS / Linux setup')}</div>
-    <p class="small muted">Then in Terminal run <span class="mono">sudo sh ~/Downloads/go-green-agent-setup.sh</span> and enter your password. Needs Python 3 (built into most Linux; on macOS the setup tells you how to add it). Runs as root from launchd or a systemd timer.</p>
+    <p class="small muted">Then open Terminal, run <span class="mono">sh ~/Downloads/go-green-agent-setup.sh</span> and enter your password when asked. Double-clicking the file only opens it as text. Needs Python 3 (built into most Linux; on macOS the setup tells you how to add it). Runs as root from launchd or a systemd timer.</p>
     <p class="small muted" style="margin-top:6px">Or run this in Terminal:</p>
     <div class="console">${esc(nixCmd)}</div><div class="actions" style="margin-top:6px"><button class="btn" id="cp-nix">Copy command</button></div>
     <p class="small muted" style="margin-top:12px">The setup files and commands contain the enrollment token. Keep them private: anyone with it can enrol a device. To change it, set a new <span class="mono">AGENT_ENROLL_TOKEN</span> and reinstall the agents. To remove the agent, run the script with <span class="mono">-Uninstall</span> or <span class="mono">uninstall</span>.</p>`;

@@ -2,30 +2,45 @@
 // (the token never goes into a URL). Windows: double-click the .cmd. macOS/Linux: one sudo command.
 const sq = v => `'${String(v).replace(/'/g, "''")}'`;          // PowerShell single-quoted string
 const shq = v => `'${String(v).replace(/'/g, `'\\''`)}'`;      // POSIX shell single-quoted string
-function utf16b64(str) {
-  let bin = '';
-  for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); bin += String.fromCharCode(c & 255, c >> 8); }
-  return btoa(bin);
-}
+// In a .cmd file "%" starts a variable, so it is doubled; inside the -Command "..." a double quote is escaped as \".
+const cmdq = v => sq(v).replace(/%/g, '%%').replace(/"/g, '\\"');
+// Plain, readable commands (no encoded PowerShell, which antivirus tends to block). The file
+// re-launches itself with administrator rights, installs the agent, and waits for a key press.
 export function windowsSetup(origin, token) {
   const ps = [
+    '[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072',
     "$ErrorActionPreference = 'Stop'",
-    'try {',
-    '  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12',
-    "  $f = Join-Path $env:TEMP 'ggt-agent.ps1'",
-    `  Invoke-WebRequest ${sq(origin + '/agent/ggt-agent.ps1')} -OutFile $f -UseBasicParsing`,
-    `  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f -Install -Server ${sq(origin)} -Token ${sq(token)}`,
-    "  if ($LASTEXITCODE) { throw \"the agent installer exited with code $LASTEXITCODE\" }",
-    "  Write-Host ''; Write-Host 'Done. This PC appears in GO-Green Device Manager within a minute.' -ForegroundColor Green",
-    "} catch { Write-Host ''; Write-Host \"Setup failed: $_\" -ForegroundColor Red }",
-    "Read-Host 'Press Enter to close' | Out-Null",
-  ].join('\r\n');
+    "$f = Join-Path $env:TEMP 'ggt-agent.ps1'",
+    `Invoke-WebRequest ${cmdq(origin + '/agent/ggt-agent.ps1')} -OutFile $f -UseBasicParsing`,
+    `& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f -Install -Server ${cmdq(origin)} -Token ${cmdq(token)}`,
+    'exit $LASTEXITCODE',
+  ].join('; ');
   return [
     '@echo off',
     'title GO-Green Agent Setup',
-    'echo Installing the GO-Green agent. Select Yes when Windows asks for administrator rights.',
-    `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','${utf16b64(ps)}'"`,
-    'if errorlevel 1 (echo Setup was cancelled. & pause)',
+    'net session >nul 2>&1',
+    'if errorlevel 1 (',
+    '  echo Asking for administrator rights. Select Yes to continue.',
+    '  set "GGT_SETUP=%~f0"',
+    '  powershell.exe -NoProfile -Command "Start-Process -FilePath $env:GGT_SETUP -Verb RunAs"',
+    '  if errorlevel 1 (echo Setup needs administrator rights and was cancelled. & pause)',
+    '  exit /b',
+    ')',
+    'echo Installing the GO-Green agent. This takes a minute or two.',
+    'echo.',
+    `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "${ps}"`,
+    'if errorlevel 1 (',
+    '  echo.',
+    '  echo Setup failed. The messages above say why.',
+    '  echo.',
+    '  pause',
+    '  exit /b 1',
+    ')',
+    'echo.',
+    'echo Done. This PC appears in GO-Green Device Manager within a minute.',
+    'echo.',
+    'pause',
+    'exit /b 0',
     '',
   ].join('\r\n');
 }
@@ -33,7 +48,7 @@ export function unixSetup(origin, token) {
   return `#!/bin/sh
 # GO-Green agent setup for macOS and Linux. Run:  sudo sh go-green-agent-setup.sh
 set -e
-if [ "$(id -u)" != "0" ]; then echo "Run this with sudo:  sudo sh $0"; exit 1; fi
+if [ "$(id -u)" != "0" ]; then echo "The agent installs for all users, so enter your password if asked."; exec sudo sh "$0" "$@"; fi
 if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 6))' >/dev/null 2>&1; then
   echo "Python 3 is needed first."
   if [ "$(uname)" = "Darwin" ]; then echo "Install the Command Line Tools with:  xcode-select --install   then run this again."; else echo "Install the python3 package, then run this again."; fi
