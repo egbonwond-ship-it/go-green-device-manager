@@ -1,68 +1,92 @@
-// State, persistence, rule evaluation and the live simulation that stands in for device agents.
-import { generate, APPS, UPDATES, BASELINES, SITES } from './seed.js';
-
-const KEY = 'gg-dm-state-v1';
+// Console state: loaded from the API (/api/console/state), kept fresh by polling, and changed
+// through the API. Rule evaluation (collections, compliance, deployment results) runs here on
+// the data the agents reported. Collection rules match api/src/lib/model.js.
 const DAY = 86400000;
+const POLL_MS = 30000;
 const listeners = new Set();
-export let state;
+export let state = null;
+export const DEFAULT_STATE = { devices: [], updates: [], apps: [], collections: [], deployments: [], updateGroups: [], adrs: [], baselines: [], maintenanceWindows: [], scripts: [], sites: [], alerts: [], log: [], commands: [], scriptRuns: [], settings: { approvedAdmins: [] } };
 
+// Error codes agents commonly report (Windows Installer, Windows Update and the agent itself).
 export const ERRORS = {
   '0x80070070': 'Not enough disk space to install',
-  '0x87D00324': 'Application was not detected after installation completed',
-  '0x80240022': 'Windows Update agent operation failed',
-  '0x87D00607': 'Content not found on the distribution point',
   '0x80070643': 'Fatal error during installation (installer exit code 1603)',
+  '0x80070652': 'Another installation is already in progress (1618)',
+  '0x80240022': 'Windows Update operation failed',
+  '0x8024402C': 'Windows Update could not reach the update server',
+  '0x80240438': 'Windows Update service could not be reached',
+  '1603': 'Fatal error during installation',
+  '1618': 'Another installation is already in progress',
+  '1619': 'Installer package could not be opened',
+  'NOT_DETECTED': 'Installer finished but the app was not detected afterwards',
+  'NO_METHOD': 'No install method for this platform in the software library',
+  'DOWNLOAD': 'Installer download failed',
+  'HASH': 'Installer file did not match its SHA-256',
+  'WINGET': 'winget is not available on this device',
+  'TIMEOUT': 'Installer did not finish within 60 minutes',
 };
 
-function fresh() {
-  const g = generate();
-  return {
-    ...g,
-    apps: APPS.map(a => ({ ...a, created: g.generatedAt - 90 * DAY, content: Object.fromEntries(SITES.map(s => [s.dp, 'Distributed'])) })),
-    baselines: BASELINES.map(b => ({ ...b, rules: b.rules.map(r => ({ ...r })) })),
-    deployments: [],
-    alerts: [],
-    log: [],
-    scriptRuns: [],
-    settings: { simulate: true },
-    seq: 1,
-  };
+// ---------- API ----------
+export class ApiError extends Error { constructor(status, message, body) { super(message); this.status = status; this.body = body; } }
+export async function api(method, path, body) {
+  let r;
+  try {
+    r = await fetch(path, { method, credentials: 'same-origin', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  } catch { throw new ApiError(0, 'Cannot reach the server. Check your connection.'); }
+  // Signed out: Static Web Apps redirects to the sign-in page, which isn't JSON.
+  if (!(r.headers.get('content-type') || '').includes('application/json')) throw new ApiError(401, 'Signed out');
+  const j = await r.json();
+  if (!r.ok) throw new ApiError(r.status, j.error || `Request failed (${r.status})`, j);
+  return j;
 }
+let errorHandler = e => console.error(e);
+export const onError = fn => { errorHandler = fn; };
+// Change something on the server. Local state is updated first so the screen responds at once;
+// if the server refuses, the error is shown and the console reloads what the server has.
+function send(method, path, body) {
+  return api(method, path, body).catch(e => { errorHandler(e); refresh(); throw e; });
+}
+const put = (kind, doc, audit) => send('PUT', `/api/console/objects/${kind}/${encodeURIComponent(doc.id)}`, { doc, audit });
+const del = (kind, id, audit) => send('DELETE', `/api/console/objects/${kind}/${encodeURIComponent(id)}?audit=${encodeURIComponent(audit || '')}`);
+const quiet = p => p.catch(() => {}); // errors already reported by send()
 
-export function load() {
-  let s = null;
-  try { const raw = localStorage.getItem(KEY); if (raw) s = JSON.parse(raw); } catch { s = null; }
-  if (!s || !s.devices) { s = fresh(); state = s; seedHistory(); save(); } else state = s;
+export async function load() {
+  const s = await api('GET', '/api/console/state');
+  state = { ...DEFAULT_STATE, ...s };
+  hydrate();
   return state;
 }
-let saveTimer = null;
-export function save() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch { /* storage unavailable: demo still works in memory */ } }, 300);
+let polling = null, inflight = null;
+export function refresh() {
+  if (inflight) return inflight;
+  inflight = api('GET', '/api/console/state').then(s => { state = { ...DEFAULT_STATE, ...s }; hydrate(); emit(); })
+    .catch(e => { if (e.status === 401 || e.status === 403) errorHandler(e); })
+    .finally(() => { inflight = null; });
+  return inflight;
 }
-export function reset() {
-  try { localStorage.removeItem(KEY); } catch { /* ignore */ }
-  state = fresh(); seedHistory(); save(); emit();
+export function startPolling() {
+  clearInterval(polling);
+  polling = setInterval(() => { if (!document.hidden) refresh(); }, POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 }
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 export function emit() { listeners.forEach(fn => fn()); }
-const nid = p => `${p}${state.seq++}`;
+const nid = p => `${p}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+// Kept for views that write and then redraw.
+export function save() {}
 
-export function log(source, message, level = 'info') {
-  state.log.unshift({ t: Date.now(), source, message, level });
-  if (state.log.length > 300) state.log.length = 300;
-}
-export function alert(severity, title, detail, deviceId) {
-  state.alerts.unshift({ id: nid('al'), t: Date.now(), severity, title, detail, deviceId, ack: false });
-  if (state.alerts.length > 150) state.alerts.length = 150;
+function hydrate() {
+  for (const d of state.deployments) computeResults(d);
 }
 
 // ---------- lookups ----------
 export const byId = (list, id) => state[list].find(x => x.id === id);
 export const device = id => byId('devices', id);
 export const app = id => byId('apps', id);
-export const update = id => UPDATES.find(u => u.id === id);
-export const UPDATE_LIST = UPDATES;
+const unknownUpdate = id => ({ id, kb: id, title: id, product: '', classification: 'Updates', severity: 'Low', released: null, sizeMB: null, reboot: false });
+export const update = id => state.updates.find(u => u.id === id) || unknownUpdate(id);
+export const updateList = () => state.updates;
+export const siteNames = () => [...state.sites.map(s => s.name), 'Unassigned'];
 
 // ---------- collections ----------
 export const FIELDS = {
@@ -70,58 +94,64 @@ export const FIELDS = {
   os: { label: 'Operating system', values: () => uniq(state.devices.map(d => d.os)) },
   osFamily: { label: 'OS family', values: () => uniq(state.devices.map(d => d.osFamily)) },
   type: { label: 'Device type', values: () => ['Laptop', 'Desktop', 'Server', 'VM'] },
-  site: { label: 'Site', values: () => SITES.map(s => s.name) },
-  dept: { label: 'Department', values: () => uniq(state.devices.map(d => d.dept)) },
+  site: { label: 'Site', values: siteNames },
   tag: { label: 'Tag', values: () => uniq(state.devices.flatMap(d => d.tags)) },
   health: { label: 'Client health', values: () => ['Healthy', 'Needs attention', 'Inactive'] },
   manufacturer: { label: 'Manufacturer', values: () => uniq(state.devices.map(d => d.manufacturer)) },
   name: { label: 'Device name', values: null },
+  user: { label: 'Primary user', values: () => uniq(state.devices.map(d => d.user).filter(Boolean)) },
   app: { label: 'Installed application', values: () => state.apps.map(a => a.name) },
 };
-const uniq = a => [...new Set(a)].sort();
+const uniq = a => [...new Set(a.filter(x => x != null && x !== ''))].sort();
+const lc = s => String(s ?? '').toLowerCase();
 
-function ruleMatch(d, r) {
+function fieldValues(d, field) {
+  if (field === 'tag') return d.tags || [];
+  if (field === 'app') return (d.installed || []).map(id => app(id)?.name).filter(Boolean);
+  return [d[field]];
+}
+export function ruleMatch(d, r) {
   const v = String(r.value ?? '').trim();
-  let actual;
-  if (r.field === 'tag') actual = d.tags;
-  else if (r.field === 'app') actual = d.installed.map(id => app(id)?.name);
-  else actual = [d[r.field]];
-  const has = x => actual.some(a => String(a).toLowerCase() === x.toLowerCase());
+  const actual = fieldValues(d, r.field);
+  const has = x => actual.some(a => lc(a) === lc(x));
   switch (r.op) {
     case 'is': return has(v);
     case 'not': return !has(v);
     case 'in': return v.split(',').map(s => s.trim()).filter(Boolean).some(has);
-    case 'contains': return actual.some(a => String(a).toLowerCase().includes(v.toLowerCase()));
-    case 'starts': return actual.some(a => String(a).toLowerCase().startsWith(v.toLowerCase()));
+    case 'contains': return actual.some(a => lc(a).includes(lc(v)));
+    case 'starts': return actual.some(a => lc(a).startsWith(lc(v)));
     default: return false;
   }
 }
 export function inCollection(d, c) {
   if (!c) return false;
-  if (c.direct) { if (c.direct.includes(d.id)) return true; if (!c.rules.length) return false; }
-  if (!c.rules.length) return true;
-  return c.match === 'any' ? c.rules.some(r => ruleMatch(d, r)) : c.rules.every(r => ruleMatch(d, r));
+  const rules = c.rules || [];
+  if (c.direct && c.direct.includes(d.id)) return true;
+  if (!rules.length) return !(c.direct && c.direct.length);
+  return c.match === 'any' ? rules.some(r => ruleMatch(d, r)) : rules.every(r => ruleMatch(d, r));
 }
 export const members = cid => { const c = byId('collections', cid); return state.devices.filter(d => inCollection(d, c)); };
 export const deviceCollections = d => state.collections.filter(c => inCollection(d, c));
 
 // ---------- compliance ----------
 const isWorkstation = d => d.type === 'Laptop' || d.type === 'Desktop';
+const orNull = v => (v === undefined ? null : v);
+// true = passes, false = fails, null = not applicable or not reported by this device's agent.
 export function evalRule(d, rule) {
   if (rule.workstationOnly && !isWorkstation(d)) return null;
   const now = Date.now();
   switch (rule.id) {
-    case 'enc': return d.encrypted;
-    case 'av': return d.avOn;
-    case 'fw': return d.fwOn;
-    case 'defs': return d.defsAgeDays < 3;
+    case 'enc': return orNull(d.encrypted);
+    case 'av': return orNull(d.avOn);
+    case 'fw': return orNull(d.fwOn);
+    case 'defs': return d.defsAgeDays == null ? null : d.defsAgeDays < 3;
     case 'osok': return d.osFamily !== 'win10';
     case 'reboot': return !d.pendingRebootSince || now - d.pendingRebootSince < 7 * DAY;
-    case 'crit': return !d.missingUpdates.some(id => { const u = update(id); return u && u.severity === 'Critical' && u.classification === 'Security Updates' && -u.released > 7; });
-    case 'lock': return d.screenLockMin > 0 && d.screenLockMin <= 10;
-    case 'admin': return !d.extraAdmins;
-    case 'usb': return d.usbBlocked;
-    case 'vpn': return d.platform === 'Linux' ? null : d.installed.includes('app-forti');
+    case 'crit': return d.updatesScannedAt ? !d.missingUpdates.some(id => { const u = update(id); return u.severity === 'Critical' && u.released && now - u.released > 7 * DAY; }) : null;
+    case 'lock': return d.screenLockMin == null ? null : d.screenLockMin > 0 && d.screenLockMin <= 10;
+    case 'admin': return d.extraAdmins == null ? null : !d.extraAdmins;
+    case 'usb': return orNull(d.usbBlocked);
+    case 'vpn': return d.platform === 'Linux' ? null : orNull(d.vpnInstalled);
     default: return null;
   }
 }
@@ -147,30 +177,10 @@ export function ruleSummary(rule) {
   for (const d of state.devices) { if (d.health === 'Inactive') continue; const r = evalRule(d, rule); if (r === true) pass++; else if (r === false) fail++; }
   return { pass, fail };
 }
-// Fixes what an agent could fix on its own (remediable rules).
-function remediate(d, rule) {
-  switch (rule.id) {
-    case 'av': d.avOn = true; break;
-    case 'fw': d.fwOn = true; break;
-    case 'defs': d.defsAgeDays = 0; break;
-    case 'lock': d.screenLockMin = 10; break;
-    case 'admin': d.extraAdmins = false; break;
-    case 'usb': d.usbBlocked = true; break;
-    case 'vpn': if (!d.installed.includes('app-forti')) d.installed.push('app-forti'); break;
-    default: return false;
-  }
-  return true;
-}
-export function remediateNow(baselineId) {
+export function setRemediate(baselineId, on) {
   const b = byId('baselines', baselineId);
-  let n = 0;
-  for (const d of state.devices) {
-    if (!d.online) continue;
-    for (const r of b.rules) if (r.remediable && evalRule(d, r) === false && remediate(d, r)) n++;
-  }
-  log('Compliance', `${b.name}: remediated ${n} setting${n === 1 ? '' : 's'} on online devices`);
-  save(); emit();
-  return n;
+  b.remediate = on; emit();
+  return quiet(put('baseline', b, `${on ? 'Turned on' : 'Turned off'} automatic remediation for ${b.name}`));
 }
 
 // ---------- updates ----------
@@ -185,10 +195,29 @@ export function updateStats(u) {
 }
 export function createUpdateGroup(name, updateIds) {
   const g = { id: nid('ug'), name, updateIds, created: Date.now() };
-  state.updateGroups.push(g);
-  log('Software updates', `Created update group “${name}” with ${updateIds.length} updates`);
-  save(); emit();
+  state.updateGroups.push(g); emit();
+  quiet(put('updateGroup', g, `Created update group “${name}” with ${updateIds.length} updates`));
   return g;
+}
+export function deleteUpdateGroup(id) {
+  const g = byId('updateGroups', id);
+  return del('updateGroup', id, `Deleted update group ${g.name}`).then(() => { state.updateGroups = state.updateGroups.filter(x => x.id !== id); emit(); });
+}
+export function saveAdr(r) {
+  const isNew = !r.id;
+  if (isNew) { r.id = nid('adr'); r.created = Date.now(); state.adrs.push(r); }
+  emit();
+  return quiet(put('adr', r, `${isNew ? 'Created' : 'Changed'} automatic deployment rule ${r.name}`));
+}
+export function toggleAdr(id) { const a = byId('adrs', id); a.enabled = !a.enabled; emit(); return quiet(put('adr', a, `${a.enabled ? 'Enabled' : 'Disabled'} rule ${a.name}`)); }
+export function deleteAdr(id) { const a = byId('adrs', id); state.adrs = state.adrs.filter(x => x.id !== id); emit(); return quiet(del('adr', id, `Deleted rule ${a.name}`)); }
+// Updates an automatic deployment rule would approve for one device right now.
+export function adrMatches(r, d) {
+  const now = Date.now();
+  return d.missingUpdates.map(update).filter(u =>
+    (!r.classifications?.length || r.classifications.includes(u.classification)) &&
+    (!r.severities?.length || r.severities.includes(u.severity)) &&
+    (!r.delayDays || (u.released || 0) <= now - r.delayDays * DAY));
 }
 
 // ---------- deployments ----------
@@ -196,33 +225,43 @@ export const STATUS = [
   ['success', 'Success', '#2f9e5a'], ['inprogress', 'In progress', '#4a90d9'], ['error', 'Error', '#d9483b'],
   ['reqnotmet', 'Requirements not met', '#e0a526'], ['unknown', 'Unknown', '#a9b5ad'],
 ];
-function initialState(dep, d) {
-  if (dep.kind === 'app') {
-    const a = app(dep.targetId);
-    if (!a.platforms.includes(d.platform)) return 'reqnotmet';
-    const has = d.installed.includes(a.id);
-    if (dep.action === 'Install' && has) return 'success';
-    if (dep.action === 'Uninstall' && !has) return 'success';
-  } else {
-    const g = byId('updateGroups', dep.targetId);
-    if (!g.updateIds.some(id => d.missingUpdates.includes(id))) return 'success';
+// Result per device: what detection shows now first, then what the agent last reported.
+function computeResults(dep) {
+  dep.results = {}; dep.errors = {}; dep.messages = {};
+  const targeted = members(dep.collectionId);
+  const ids = new Set(targeted.map(d => d.id));
+  for (const d of state.devices) if (d.depState?.[dep.id] && !ids.has(d.id)) targeted.push(d);
+  for (const d of targeted) {
+    const st = d.depState?.[dep.id];
+    let s = null;
+    if (dep.kind === 'app') {
+      const a = app(dep.targetId);
+      if (a && !a.platforms.includes(d.platform)) s = 'reqnotmet';
+      else if (a) { const has = d.installed.includes(a.id); if (dep.action === 'Uninstall' ? !has : has) s = 'success'; }
+    } else {
+      const g = byId('updateGroups', dep.targetId);
+      if (d.updatesScannedAt && !(g?.updateIds || []).some(id => d.missingUpdates.includes(id))) s = 'success';
+    }
+    if (!s) s = st && ['error', 'inprogress'].includes(st.state) ? st.state : 'unknown';
+    dep.results[d.id] = s;
+    if (s === 'error') { dep.errors[d.id] = st.errorCode || 'Error'; dep.messages[d.id] = st.message || ''; }
+    else if (st?.message) dep.messages[d.id] = st.message;
   }
-  return 'unknown';
 }
 export function createDeployment(o) {
-  const dep = {
-    id: nid('dep'), created: Date.now(), createdBy: 'GGT\\it.admin', results: {}, errors: {}, enabled: true,
-    respectMW: true, restart: 'Suppress', purpose: 'Required', action: 'Install', ...o,
-  };
+  const dep = { id: nid('dep'), created: Date.now(), createdBy: state.user, enabled: true, respectMW: true, restart: 'Suppress', action: 'Install', ...o };
   const target = dep.kind === 'app' ? app(dep.targetId) : byId('updateGroups', dep.targetId);
-  dep.name = dep.name || `${target.name} → ${byId('collections', dep.collectionId).name}`;
-  for (const d of members(dep.collectionId)) dep.results[d.id] = initialState(dep, d);
+  const col = byId('collections', dep.collectionId);
+  dep.name = dep.name || `${target.name} → ${col.name}`;
+  const { results, errors, messages, ...doc } = dep;
   state.deployments.unshift(dep);
-  log('Deployments', `Deployed ${target.name} to ${byId('collections', dep.collectionId).name} (${dep.purpose}, ${Object.keys(dep.results).length} devices)`);
-  save(); emit();
+  computeResults(dep); emit();
+  quiet(put('deployment', doc, `Deployed ${target.name} to ${col.name} (${Object.keys(dep.results).length} devices)`));
   return dep;
 }
+const depDoc = ({ results, errors, messages, ...doc }) => doc;
 export function deploymentSummary(dep) {
+  if (!dep.results) computeResults(dep);
   const c = { success: 0, inprogress: 0, error: 0, reqnotmet: 0, unknown: 0 };
   for (const s of Object.values(dep.results)) c[s]++;
   c.total = Object.keys(dep.results).length;
@@ -231,224 +270,82 @@ export function deploymentSummary(dep) {
 }
 export function retryFailed(depId) {
   const dep = byId('deployments', depId);
-  let n = 0;
-  for (const [id, s] of Object.entries(dep.results)) if (s === 'error') { dep.results[id] = 'unknown'; delete dep.errors[id]; n++; }
-  log('Deployments', `Retrying ${n} failed device${n === 1 ? '' : 's'} for ${dep.name}`);
-  save(); emit();
+  const n = Object.values(dep.results).filter(s => s === 'error').length;
+  dep.retryAt = Date.now(); emit();
+  quiet(put('deployment', depDoc(dep), `Retrying ${n} failed device${n === 1 ? '' : 's'} for ${dep.name}`));
   return n;
+}
+export function setDeploymentEnabled(depId, on) {
+  const dep = byId('deployments', depId);
+  dep.enabled = on; emit();
+  return quiet(put('deployment', depDoc(dep), `${on ? 'Enabled' : 'Disabled'} ${dep.name}`));
 }
 export function deleteDeployment(depId) {
   const dep = byId('deployments', depId);
-  state.deployments = state.deployments.filter(d => d.id !== depId);
-  log('Deployments', `Deleted deployment ${dep.name}`);
-  save(); emit();
-}
-function complete(dep, d) {
-  if (dep.kind === 'app') {
-    const a = app(dep.targetId);
-    if (dep.action === 'Install') { if (!d.installed.includes(a.id)) d.installed.push(a.id); }
-    else d.installed = d.installed.filter(x => x !== a.id);
-  } else {
-    const g = byId('updateGroups', dep.targetId);
-    for (const id of g.updateIds) {
-      if (!d.missingUpdates.includes(id)) continue;
-      d.missingUpdates = d.missingUpdates.filter(x => x !== id);
-      d.installedUpdates.push(id);
-      const u = update(id);
-      if (u.reboot) { if (dep.restart === 'Allow') d.lastBoot = Date.now(); else if (!d.pendingRebootSince) d.pendingRebootSince = Date.now(); }
-    }
-  }
+  state.deployments = state.deployments.filter(d => d.id !== depId); emit();
+  return quiet(del('deployment', depId, `Deleted deployment ${dep.name}`));
 }
 
-// ---------- device actions ----------
-export const SCRIPTS = [
-  { id: 'disk', name: 'Get disk usage', lang: 'PowerShell', body: 'Get-Volume | Where DriveLetter | Select DriveLetter, SizeRemaining, Size' },
-  { id: 'temp', name: 'Clear temp files', lang: 'PowerShell', body: 'Remove-Item "$env:WINDIR\\Temp\\*","$env:TEMP\\*" -Recurse -Force -ErrorAction SilentlyContinue' },
-  { id: 'spool', name: 'Restart print spooler', lang: 'PowerShell', body: 'Restart-Service -Name Spooler -Force; Get-Service Spooler' },
-  { id: 'gpupdate', name: 'Refresh group policy', lang: 'PowerShell', body: 'gpupdate /force' },
-  { id: 'logs', name: 'Collect agent logs', lang: 'PowerShell', body: 'Compress-Archive "$env:ProgramData\\GGT Agent\\Logs" "\\\\GGT-LAG-DP01\\Logs$\\$env:COMPUTERNAME.zip"' },
-];
-export function runScript(scriptId, deviceIds) {
-  const s = SCRIPTS.find(x => x.id === scriptId);
-  const out = [];
-  for (const id of deviceIds) {
-    const d = device(id);
-    if (!d.online) { out.push({ device: d.name, status: 'Offline', output: 'Device is offline. The script will run at next check-in.' }); continue; }
-    if (d.platform !== 'Windows') { out.push({ device: d.name, status: 'Not run', output: 'PowerShell scripts target Windows devices.' }); continue; }
-    let o = '';
-    if (s.id === 'disk') { const used = d.diskGB * (100 - d.diskFreePct) / 100; o = `DriveLetter SizeRemaining      Size\n----------- -------------      ----\nC           ${(d.diskGB - used).toFixed(1)} GB      ${d.diskGB} GB`; }
-    if (s.id === 'temp') { const freed = (0.3 + Math.random() * 3.5).toFixed(2); d.diskFreePct = Math.min(95, d.diskFreePct + 1 + Math.round(Math.random() * 3)); o = `Removed ${Math.floor(400 + Math.random() * 6000)} files, freed ${freed} GB`; }
-    if (s.id === 'spool') o = 'Status   Name     DisplayName\n------   ----     -----------\nRunning  Spooler  Print Spooler';
-    if (s.id === 'gpupdate') o = 'Updating policy...\n\nComputer Policy update has completed successfully.\nUser Policy update has completed successfully.';
-    if (s.id === 'logs') o = `Uploaded ${d.name}.zip (${(1 + Math.random() * 9).toFixed(1)} MB) to \\\\GGT-LAG-DP01\\Logs$`;
-    out.push({ device: d.name, status: 'Succeeded', output: o });
-  }
-  state.scriptRuns.unshift({ id: nid('sr'), t: Date.now(), script: s.name, count: deviceIds.length, ok: out.filter(o => o.status === 'Succeeded').length });
-  log('Scripts', `Ran “${s.name}” on ${deviceIds.length} device${deviceIds.length === 1 ? '' : 's'}`);
-  save(); emit();
-  return out;
+// ---------- scripts and device actions ----------
+export const scriptsFor = platform => state.scripts.filter(s => (s.lang === 'PowerShell') === (platform === 'Windows'));
+export async function runScript(scriptId, deviceIds) {
+  const r = await send('POST', '/api/console/commands', { type: 'script', scriptId, deviceIds });
+  refresh();
+  return r;
 }
 export function deviceAction(id, action) {
-  const d = device(id);
-  const msgs = {
-    policy: `Machine policy retrieval requested on ${d.name}`,
-    hwinv: `Hardware inventory cycle requested on ${d.name}`,
-    swinv: `Software inventory cycle requested on ${d.name}`,
-    eval: `Compliance evaluation requested on ${d.name}`,
-    updscan: `Software update scan requested on ${d.name}`,
-    restart: `Restart requested on ${d.name}`,
-    wake: `Wake-on-LAN packet sent to ${d.name}`,
-  };
-  if (!d.online && action !== 'wake') { log('Client notification', `${msgs[action]}: device offline, queued for next check-in`, 'warn'); save(); emit(); return 'queued'; }
-  if (action === 'restart') { d.lastBoot = Date.now(); d.pendingRebootSince = null; }
-  if (action === 'wake') { d.online = true; d.lastSeen = Date.now(); if (d.health === 'Inactive') d.health = 'Healthy'; }
-  if (action === 'eval') { /* evaluation is live */ }
-  if (action === 'policy') d.lastSeen = Date.now();
-  log('Client notification', msgs[action]);
-  save(); emit();
-  return 'ok';
+  return send('POST', '/api/console/commands', { type: action, deviceIds: [id] }).then(r => { refresh(); return r; });
 }
-export function setTags(id, tags) { device(id).tags = tags; save(); emit(); }
+export const runCommands = runId => state.commands.filter(c => c.runId === runId);
+export function saveScript(s) {
+  const isNew = !s.id;
+  if (isNew) { s.id = nid('sc'); state.scripts.push(s); }
+  emit();
+  return quiet(put('script', s, `${isNew ? 'Added' : 'Changed'} script ${s.name}`));
+}
+export function deleteScript(id) { const s = byId('scripts', id); state.scripts = state.scripts.filter(x => x.id !== id); emit(); return quiet(del('script', id, `Deleted script ${s.name}`)); }
 
-// ---------- library, collections, maintenance windows ----------
-export function addApp(a) {
-  const x = { id: nid('app-'), created: Date.now(), prevalence: 0, content: Object.fromEntries(SITES.map(s => [s.dp, 'In progress'])), ...a };
-  state.apps.push(x);
-  log('Software library', `Added application ${a.name} ${a.version}; distributing content to ${SITES.length} distribution points`);
-  save(); emit();
-  return x;
+// ---------- devices ----------
+export function setTags(id, tags) {
+  device(id).tags = tags; hydrate(); emit();
+  return quiet(send('PUT', `/api/console/devices/${encodeURIComponent(id)}`, { tags }));
+}
+export const deviceDetail = id => api('GET', `/api/console/devices/${encodeURIComponent(id)}`);
+export function retireDevice(id) {
+  return send('DELETE', `/api/console/devices/${encodeURIComponent(id)}`).then(() => { state.devices = state.devices.filter(d => d.id !== id); hydrate(); emit(); });
+}
+export const enrollment = () => api('GET', '/api/console/enrollment');
+
+// ---------- library, collections, sites, maintenance windows, settings ----------
+export function saveApp(a) {
+  const isNew = !a.id;
+  if (isNew) { a.id = nid('app'); a.created = Date.now(); state.apps.push(a); } else Object.assign(app(a.id), a);
+  hydrate(); emit();
+  quiet(put('app', isNew ? a : app(a.id), `${isNew ? 'Added' : 'Changed'} application ${a.name} ${a.version}`));
+  return a;
+}
+export function deleteApp(id) {
+  const a = app(id);
+  return del('app', id, `Deleted application ${a.name}`).then(() => { state.apps = state.apps.filter(x => x.id !== id); emit(); });
 }
 export function saveCollection(c) {
-  if (c.id) Object.assign(byId('collections', c.id), c);
-  else { c.id = nid('c-'); state.collections.push(c); }
-  log('Collections', `Saved collection ${c.name} (${members(c.id).length} members)`);
-  save(); emit();
+  const isNew = !c.id;
+  if (isNew) { c.id = nid('c'); state.collections.push(c); } else Object.assign(byId('collections', c.id), c);
+  hydrate(); emit();
+  quiet(put('collection', isNew ? c : byId('collections', c.id), `Saved collection ${c.name} (${members(c.id).length} members)`));
   return c;
 }
 export function deleteCollection(id) {
   const c = byId('collections', id);
-  if (state.deployments.some(d => d.collectionId === id)) return false;
-  state.collections = state.collections.filter(x => x.id !== id);
-  log('Collections', `Deleted collection ${c.name}`);
-  save(); emit();
+  if ([...state.deployments, ...state.adrs, ...state.maintenanceWindows].some(d => d.collectionId === id)) return false;
+  state.collections = state.collections.filter(x => x.id !== id); emit();
+  quiet(del('collection', id, `Deleted collection ${c.name}`));
   return true;
 }
-export function addMaintenanceWindow(mw) { state.maintenanceWindows.push({ id: nid('mw'), ...mw }); log('Maintenance windows', `Added ${mw.name}`); save(); emit(); }
-export function deleteMaintenanceWindow(id) { state.maintenanceWindows = state.maintenanceWindows.filter(m => m.id !== id); save(); emit(); }
-export function toggleAdr(id) { const a = byId('adrs', id); a.enabled = !a.enabled; log('Software updates', `${a.enabled ? 'Enabled' : 'Disabled'} rule ${a.name}`); save(); emit(); }
-export function runAdr(id) {
-  const a = byId('adrs', id);
-  a.lastRun = Date.now(); a.lastResult = 'Success: evaluated, deployment refreshed';
-  const existing = state.deployments.find(d => d.kind === 'updates' && d.targetId === a.targetGroup && d.collectionId === a.collectionId);
-  if (!existing) createDeployment({ kind: 'updates', targetId: a.targetGroup, collectionId: a.collectionId, purpose: 'Required', name: `${a.name} (ADR)` });
-  log('Software updates', `Ran rule ${a.name}`);
-  save(); emit();
-}
-export function ackAlert(id) { const a = byId('alerts', id); if (a) a.ack = true; save(); emit(); }
-export function ackAll() { state.alerts.forEach(a => a.ack = true); save(); emit(); }
-
-// ---------- simulation ----------
-const chance = p => Math.random() < p;
-const pickOne = arr => arr[Math.floor(Math.random() * arr.length)];
-
-export function tick() {
-  if (!state.settings.simulate) return;
-  const now = Date.now();
-  const devs = state.devices;
-  // heartbeats & metrics
-  for (const d of devs) {
-    if (d.health === 'Inactive') continue;
-    if (d.online) {
-      d.lastSeen = now;
-      d.cpuPct = clamp(d.cpuPct + Math.round((Math.random() - 0.5) * 14), 1, 99);
-      d.memPct = clamp(d.memPct + Math.round((Math.random() - 0.5) * 6), 15, 97);
-      if (chance(0.002)) { d.online = false; if (d.type === 'Server' && d.tags.includes('critical-server')) alert('Critical', `${d.name} stopped responding`, `No heartbeat from critical server at ${d.site}.`, d.id); }
-    } else if (chance(0.01)) { d.online = true; d.lastSeen = now; d.cpuPct = 10; d.memPct = 40; if (d.health === 'Needs attention' && chance(0.5)) d.health = 'Healthy'; }
-  }
-  // occasional drift that compliance should catch
-  if (chance(0.06)) {
-    const d = pickOne(devs.filter(x => x.online && x.platform === 'Windows'));
-    const what = pickOne(['fw', 'av', 'admin', 'disk']);
-    if (what === 'fw' && d.fwOn) { d.fwOn = false; alert('Important', `Firewall turned off on ${d.name}`, 'Endpoint Security Baseline will flag and remediate this at next evaluation.', d.id); }
-    if (what === 'av' && d.avOn) { d.avOn = false; alert('Critical', `Real-time protection disabled on ${d.name}`, 'Antivirus real-time protection was turned off.', d.id); }
-    if (what === 'admin' && !d.extraAdmins) { d.extraAdmins = true; alert('Important', `New local admin on ${d.name}`, 'An unapproved account was added to Administrators.', d.id); }
-    if (what === 'disk' && d.diskFreePct > 8) { d.diskFreePct = 3 + Math.floor(Math.random() * 4); alert('Moderate', `Low disk space on ${d.name}`, `Only ${d.diskFreePct}% free on C:. Installs may fail with 0x80070070.`, d.id); }
-  }
-  // auto-remediation for baselines that have it on
-  for (const b of state.baselines) {
-    if (!b.remediate) continue;
-    for (const r of b.rules) {
-      if (!r.remediable) continue;
-      for (const d of devs) if (d.online && evalRule(d, r) === false && chance(0.04)) { remediate(d, r); log('Compliance', `Remediated “${r.name}” on ${d.name}`); }
-    }
-  }
-  // deployments progress
-  for (const dep of state.deployments) {
-    if (!dep.enabled) continue;
-    const isAvail = dep.purpose === 'Available';
-    let finished = 0, failed = 0;
-    for (const [id, s] of Object.entries(dep.results)) {
-      const d = device(id);
-      if (!d || !d.online) continue;
-      if (s === 'unknown' && chance(isAvail ? 0.03 : 0.3)) dep.results[id] = 'inprogress';
-      else if (s === 'inprogress' && chance(0.25)) {
-        const size = dep.kind === 'app' ? app(dep.targetId).sizeMB : 600;
-        let err = null;
-        if (d.diskFreePct < 8 && size > 50) err = '0x80070070';
-        else if (chance(0.035)) err = pickOne(dep.kind === 'app' ? ['0x87D00324', '0x80070643', '0x87D00607'] : ['0x80240022', '0x80070643']);
-        if (err) { dep.results[id] = 'error'; dep.errors[id] = err; failed++; }
-        else { dep.results[id] = 'success'; complete(dep, d); finished++; }
-      }
-    }
-    if (failed) log('Deployments', `${dep.name}: ${failed} device${failed > 1 ? 's' : ''} failed`, 'error');
-    const sum = deploymentSummary(dep);
-    if (!dep.doneLogged && sum.inprogress === 0 && sum.unknown === 0) { dep.doneLogged = true; log('Deployments', `${dep.name} finished: ${sum.success} succeeded, ${sum.error} failed`); }
-  }
-  save();
-  emit();
-}
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-
-// A few weeks of realistic history so the console isn't empty on first open.
-function seedHistory() {
-  const now = Date.now();
-  const mk = (o, ageMs, progress) => {
-    const dep = createDeployment(o);
-    dep.created = now - ageMs;
-    for (const id of Object.keys(dep.results)) {
-      if (dep.results[id] !== 'unknown') continue;
-      const d = device(id);
-      const x = Math.random();
-      if (!d.online && x < 0.7) continue;
-      if (x < progress) {
-        if (d.diskFreePct < 8 || Math.random() < 0.03) { dep.results[id] = 'error'; dep.errors[id] = d.diskFreePct < 8 ? '0x80070070' : '0x80070643'; }
-        else { dep.results[id] = 'success'; complete(dep, d); }
-      } else if (x < progress + 0.08) dep.results[id] = 'inprogress';
-    }
-  };
-  mk({ kind: 'app', targetId: 'app-forti', collectionId: 'c-wks', purpose: 'Required', name: 'FortiClient VPN 7.4.1 · All workstations' }, 21 * DAY, 0.97);
-  mk({ kind: 'app', targetId: 'app-3cx', collectionId: 'c-wks', purpose: 'Available', name: '3CX Desktop App · Software Center' }, 30 * DAY, 0.5);
-  mk({ kind: 'app', targetId: 'app-pvsyst', collectionId: 'c-eng', purpose: 'Required', name: 'PVsyst 8.0.4 · Engineering & Installations' }, 6 * DAY, 0.8);
-  mk({ kind: 'updates', targetId: 'ug-2611', collectionId: 'c-pilot', purpose: 'Required', restart: 'Allow', name: '2026-11 Patch Tuesday · Pilot ring' }, 8 * DAY, 0.95);
-  mk({ kind: 'updates', targetId: 'ug-2611', collectionId: 'c-broad', purpose: 'Required', name: '2026-11 Patch Tuesday · Broad ring' }, 1 * DAY, 0.35);
-  mk({ kind: 'updates', targetId: 'ug-defs', collectionId: 'c-all', purpose: 'Required', name: 'Defender definitions (ADR)' }, 10 * 3600000, 0.75);
-  mk({ kind: 'app', targetId: 'app-ivms', collectionId: 'c-field', purpose: 'Required', name: 'Hikvision iVMS-4200 · Field laptops' }, 2 * DAY, 0.45);
-  state.log = [];
-  const sample = [
-    ['Deployments', 'Defender definitions (ADR): definitions 1.421.x published to all distribution points', 'info', 0.4],
-    ['Software updates', 'Synchronization with Microsoft Update completed: 14 new, 3 superseded, 0 expired', 'info', 3],
-    ['Compliance', 'Endpoint Security Baseline evaluated on 238 devices', 'info', 4],
-    ['Distribution points', 'GGT-KAN-DP01: content validation finished, 0 hash mismatches', 'info', 6],
-    ['Deployments', '2026-11 Patch Tuesday · Broad ring created by ADR “Patch Tuesday · Broad ring”', 'info', 24],
-    ['Client health', '11 clients have not reported for more than 14 days and are marked inactive', 'warn', 26],
-  ];
-  for (const [s, m, l, h] of sample) state.log.push({ t: now - h * 3600000, source: s, message: m, level: l });
-  const al = [
-    ['Critical', 'Windows 10 reached end of support', 'Devices on Windows 10 no longer get security fixes. Deploy the 24H2 feature update to “Windows 10 (upgrade to 11)”.', null, 30],
-    ['Important', 'Deployment errors above 5%', '2026-11 Patch Tuesday · Broad ring has error rate above threshold on some devices.', null, 5],
-  ];
-  state.alerts = al.map(([severity, title, detail, deviceId, h]) => ({ id: nid('al'), t: now - h * 3600000, severity, title, detail, deviceId, ack: false }));
-  const lowDisk = state.devices.filter(d => d.diskFreePct < 8 && d.online).slice(0, 3);
-  for (const d of lowDisk) state.alerts.push({ id: nid('al'), t: now - Math.random() * 20 * 3600000, severity: 'Moderate', title: `Low disk space on ${d.name}`, detail: `${d.diskFreePct}% free on the system drive.`, deviceId: d.id, ack: false });
-  state.alerts.sort((a, b) => b.t - a.t);
-}
+export function addMaintenanceWindow(mw) { const m = { id: nid('mw'), ...mw }; state.maintenanceWindows.push(m); emit(); return quiet(put('maintenanceWindow', m, `Added maintenance window ${mw.name}`)); }
+export function deleteMaintenanceWindow(id) { const m = byId('maintenanceWindows', id); state.maintenanceWindows = state.maintenanceWindows.filter(x => x.id !== id); emit(); return quiet(del('maintenanceWindow', id, `Removed maintenance window ${m.name}`)); }
+export function saveSite(s) { const isNew = !s.id; if (isNew) { s.id = nid('site'); state.sites.push(s); } emit(); return quiet(put('site', s, `${isNew ? 'Added' : 'Changed'} site ${s.name}`).then(() => refresh())); }
+export function deleteSite(id) { const s = byId('sites', id); state.sites = state.sites.filter(x => x.id !== id); emit(); return quiet(del('site', id, `Removed site ${s.name}`).then(() => refresh())); }
+export function saveSettings(patch, audit) { state.settings = { ...state.settings, ...patch, id: 'main' }; emit(); return quiet(put('settings', state.settings, audit).then(() => refresh())); }
+export function ackAlert(id) { const a = byId('alerts', id); if (a) a.ack = true; emit(); return quiet(send('POST', '/api/console/alerts/ack', { ids: [id] })); }
+export function ackAll() { state.alerts.forEach(a => { a.ack = true; }); emit(); return quiet(send('POST', '/api/console/alerts/ack', { all: true })); }

@@ -2,6 +2,7 @@
   "IsEncrypted": false,
   "Values": {
     "FUNCTIONS_WORKER_RUNTIME": "node",
-    "AGENT_ENROLL_TOKEN": "change-me"
+    "AGENT_ENROLL_TOKEN": "change-me",
+    "ADMIN_USERS": "your-github-username"
   }
 }

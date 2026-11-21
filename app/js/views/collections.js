@@ -29,7 +29,7 @@ function detail(el, id) {
   if (!c) { el.innerHTML = '<p>Collection not found. <a href="#/collections">Back to collections</a></p>'; return; }
   el.innerHTML = `<div class="page-head"><div><a class="small" href="#/collections">← Collections</a><h1>${esc(c.name)}</h1><p class="muted">${esc(c.description || '')}</p></div>
     <div class="actions">${c.builtIn ? '' : '<button class="btn" id="edit">Edit rules</button><button class="btn danger" id="del">Delete</button>'}<a class="btn primary" href="#/deployments?new=1&c=${c.id}">Deploy to this collection</a></div></div>
-    <div class="card" style="margin-bottom:16px"><div class="kv"><div><span>Membership rule</span><b>${esc(ruleText(c))}</b></div><div><span>Members</span><b id="cnt"></b></div><div><span>Maintenance windows</span><b>${S.state.maintenanceWindows.filter(m => m.collectionId === c.id).map(m => esc(m.name)).join(', ') || 'None'}</b></div><div><span>Deployments</span><b>${S.state.deployments.filter(d => d.collectionId === c.id).map(d => `<a href="#/deployments/${d.id}">${esc(d.name)}</a>`).join('<br>') || 'None'}</b></div></div></div>
+    <div class="card" style="margin-bottom:16px"><div class="kv"><div><span>Membership rule</span><b>${esc(ruleText(c))}</b></div><div><span>Members</span><b id="cnt"></b></div><div><span>Maintenance windows</span><b>${S.state.maintenanceWindows.filter(m => m.collectionId === c.id).map(m => esc(m.name)).join(', ') || 'None'}</b></div><div><span>Deployments</span><b>${S.state.deployments.filter(d => d.collectionId === c.id).map(d => `<a href="#/deployments/${d.id}">${esc(d.name)}</a>`).join('<br>') || 'None'}</b></div><div><span>Update rules</span><b>${S.state.adrs.filter(a => a.collectionId === c.id).map(a => esc(a.name)).join('<br>') || 'None'}</b></div></div></div>
     <div id="tbl"></div>`;
   const t = table(el.querySelector('#tbl'), {
     rows: () => S.members(id), search: d => `${d.name} ${d.user || ''}`, onRow: d => openDevice(d.id),
@@ -44,16 +44,16 @@ function detail(el, id) {
   cnt();
   el.querySelector('#edit')?.addEventListener('click', () => editor(c));
   el.querySelector('#del')?.addEventListener('click', () => confirmBox('Delete collection?', `Delete <b>${esc(c.name)}</b>? Devices are not affected.`, 'Delete', () => {
-    if (!S.deleteCollection(id)) { toast('Remove the deployments that target this collection first.', true); return; }
+    if (!S.deleteCollection(id)) { toast('Remove the deployments, update rules and maintenance windows that use this collection first.', true); return; }
     toast('Collection deleted'); location.hash = '#/collections';
   }, true));
   return { refresh: () => { t.draw(); cnt(); } };
 }
 
 export function editor(c) {
-  const draft = c ? JSON.parse(JSON.stringify(c)) : { name: '', description: '', match: 'all', rules: [{ field: 'site', op: 'is', value: 'Lagos HQ' }] };
+  const draft = c ? JSON.parse(JSON.stringify(c)) : { name: '', description: '', match: 'all', rules: [{ field: 'platform', op: 'is', value: 'Windows' }] };
   const m = modal(c ? 'Edit collection' : 'New collection', `<div class="form-grid">
-      <label class="field wide">Name <input id="n" value="${esc(draft.name)}" placeholder="e.g. Abuja finance laptops"></label>
+      <label class="field wide">Name <input id="n" value="${esc(draft.name)}" placeholder="e.g. Ring 0 · Pilot"></label>
       <label class="field wide">Description <input id="ds" value="${esc(draft.description || '')}"></label>
       <label class="field">Devices must match <select id="mt"><option value="all" ${draft.match === 'all' ? 'selected' : ''}>all rules</option><option value="any" ${draft.match === 'any' ? 'selected' : ''}>any rule</option></select></label></div>
     <h3 style="margin:16px 0 8px">Rules</h3><div id="rules"></div><button class="btn sm" id="add">+ Add rule</button>

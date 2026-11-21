@@ -1,37 +1,35 @@
 {
   "navigationFallback": {
     "rewrite": "/index.html",
-    "exclude": [
-      "/js/*",
-      "/*.css",
-      "/*.svg",
-      "/api/*"
-    ]
+    "exclude": ["/js/*", "/agent/*", "/*.css", "/*.svg", "/*.html", "/api/*"]
   },
   "platform": {
     "apiRuntime": "node:20"
   },
   "routes": [
-    {
-      "route": "/api/devices",
-      "allowedRoles": [
-        "authenticated"
-      ]
-    },
-    {
-      "route": "/api/agent/*",
-      "allowedRoles": [
-        "anonymous"
-      ]
-    }
+    { "route": "/api/agent/*", "allowedRoles": ["anonymous"] },
+    { "route": "/api/health", "allowedRoles": ["anonymous"] },
+    { "route": "/agent/*", "allowedRoles": ["anonymous"], "headers": { "Cache-Control": "no-cache" } },
+    { "route": "/login.html", "allowedRoles": ["anonymous"] },
+    { "route": "/styles.css", "allowedRoles": ["anonymous"] },
+    { "route": "/logo-full.svg", "allowedRoles": ["anonymous"] },
+    { "route": "/logo-mark.svg", "allowedRoles": ["anonymous"] },
+    { "route": "/.auth/login/twitter", "statusCode": 404 },
+    { "route": "/*", "allowedRoles": ["authenticated"] }
   ],
+  "responseOverrides": {
+    "401": { "redirect": "/login.html", "statusCode": 302 }
+  },
   "globalHeaders": {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'"
+    "Strict-Transport-Security": "max-age=31536000",
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'"
   },
   "mimeTypes": {
-    ".js": "text/javascript"
+    ".js": "text/javascript",
+    ".ps1": "text/plain; charset=utf-8",
+    ".py": "text/plain; charset=utf-8"
   }
 }

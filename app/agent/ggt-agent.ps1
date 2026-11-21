@@ -1,0 +1,471 @@
+<#
+.SYNOPSIS
+  Go-Green Device Manager agent for Windows 10, 11 and Windows Server 2016 or later.
+
+.DESCRIPTION
+  Install (PowerShell as administrator):
+    .\ggt-agent.ps1 -Install -Server https://<your-site> -Token '<enrollment token>'
+  Uninstall:
+    .\ggt-agent.ps1 -Uninstall
+
+  Every 5 minutes (scheduled task "\Go-Green\GGT Agent", running as SYSTEM) the agent:
+    1. collects hardware, OS, network, security settings and installed programs,
+    2. scans Windows Update for missing updates (every 6 hours, or when asked),
+    3. checks in, then pulls its policy from the Device Manager,
+    4. runs queued scripts and actions, fixes settings for baselines with remediation on,
+       installs or removes deployed applications and installs approved updates,
+    5. reports each result back.
+  Files: C:\ProgramData\GGT Agent (config.json holds the device key; only SYSTEM and Administrators can read it).
+#>
+[CmdletBinding(DefaultParameterSetName = 'Run')]
+param(
+  [Parameter(ParameterSetName = 'Install', Mandatory = $true)][switch]$Install,
+  [Parameter(ParameterSetName = 'Install', Mandatory = $true)][string]$Server,
+  [Parameter(ParameterSetName = 'Install', Mandatory = $true)][string]$Token,
+  [Parameter(ParameterSetName = 'Install')][switch]$NoSchedule,
+  [Parameter(ParameterSetName = 'Uninstall', Mandatory = $true)][switch]$Uninstall,
+  [Parameter(ParameterSetName = 'Run')][switch]$Run,
+  [switch]$SkipUpdateScan,
+  [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
+)
+
+$AgentVersion = '2.0.0'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$ConfigPath = Join-Path $AgentDir 'config.json'
+$StatePath = Join-Path $AgentDir 'state.json'
+$LogPath = Join-Path $AgentDir 'Logs\agent.log'
+$TaskName = 'GGT Agent'
+$TaskPath = '\Go-Green\'
+
+function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+function Iso($d) { if ($d) { ([datetime]$d).ToUniversalTime().ToString('o') } else { $null } }
+
+function Write-Log([string]$Message, [string]$Level = 'info') {
+  $line = '{0} [{1}] {2}' -f (Get-Date).ToString('s'), $Level, $Message
+  Write-Host $line
+  try {
+    $dir = Split-Path $LogPath
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    if ((Test-Path $LogPath) -and (Get-Item $LogPath).Length -gt 1MB) { Move-Item $LogPath "$LogPath.1" -Force }
+    Add-Content -Path $LogPath -Value $line -Encoding UTF8
+  } catch { }
+}
+
+function Read-Json($Path) {
+  if (Test-Path $Path) { try { return Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+  return $null
+}
+function Write-Json($Path, $Object) { Set-Content -Path $Path -Value (ConvertTo-Json -InputObject $Object -Depth 10) -Encoding UTF8 }
+
+# PSCustomObject (from JSON) to hashtable, so state can be changed freely.
+function To-Hash($o) {
+  $h = @{}
+  if ($o) { foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value } }
+  return $h
+}
+
+# ---------------------------------------------------------------- server calls
+function Invoke-Api([string]$Method, [string]$Path, $Body) {
+  $headers = @{ 'x-ggt-enroll-token' = $script:Config.token }
+  if ($script:Config.deviceKey) { $headers['x-ggt-device-key'] = $script:Config.deviceKey }
+  $req = @{ Uri = ($script:Config.server + $Path); Method = $Method; Headers = $headers; UseBasicParsing = $true; TimeoutSec = 120 }
+  if ($null -ne $Body) {
+    $req.Body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Body -Depth 10 -Compress))
+    $req.ContentType = 'application/json; charset=utf-8'
+  }
+  try { return Invoke-RestMethod @req } catch {
+    $code = 0
+    try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+    $detail = $_.ErrorDetails.Message
+    if (-not $detail) { $detail = $_.Exception.Message }
+    $err = New-Object Exception("$Method $Path failed ($code): $detail")
+    $err.Data['status'] = $code
+    throw $err
+  }
+}
+
+# ---------------------------------------------------------------- inventory
+function Get-Inventory {
+  $cs = Get-CimInstance Win32_ComputerSystem
+  $os = Get-CimInstance Win32_OperatingSystem
+  $bios = Get-CimInstance Win32_BIOS
+  $cpus = @(Get-CimInstance Win32_Processor)
+  $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+  $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+  $release = if ($cv.DisplayVersion) { $cv.DisplayVersion } else { $cv.ReleaseId }
+  $caption = ($os.Caption -replace '^Microsoft\s+', '').Trim()
+  # Windows 11 still reports "Windows 10" in some places; the build number decides.
+  if ($os.ProductType -eq 1 -and [int]$os.BuildNumber -ge 22000) { $caption = $caption -replace 'Windows 10', 'Windows 11' }
+  $osName = if ($release -and $os.ProductType -eq 1) { "$caption $release" } else { $caption }
+  $type = 'Desktop'
+  if ("$($cs.Model) $($cs.Manufacturer)" -match 'Virtual|VMware|KVM|QEMU|HVM|Xen|innotek|Amazon EC2|Google Compute') { $type = 'VM' }
+  elseif ($os.ProductType -ne 1) { $type = 'Server' }
+  elseif ($cs.PCSystemType -eq 2) { $type = 'Laptop' }
+  $net = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Where-Object { $_.DefaultIPGateway } | Select-Object -First 1
+  if (-not $net) { $net = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Select-Object -First 1 }
+  $ip = if ($net) { @($net.IPAddress | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })[0] } else { $null }
+  $load = ($cpus | Measure-Object -Property LoadPercentage -Average).Average
+  $freePct = if ($disk.Size) { [math]::Round($disk.FreeSpace / $disk.Size * 100) } else { $null }
+  return [ordered]@{
+    name = $env:COMPUTERNAME; platform = 'Windows'; os = $osName; build = "$($os.BuildNumber).$($cv.UBR)"; type = $type
+    manufacturer = "$($cs.Manufacturer)".Trim(); model = "$($cs.Model)".Trim(); serial = "$($bios.SerialNumber)".Trim(); cpu = "$($cpus[0].Name)".Trim()
+    ramGB = [math]::Round($cs.TotalPhysicalMemory / 1GB); diskGB = [math]::Round($disk.Size / 1GB); diskFreePct = $freePct
+    ip = $ip; mac = if ($net) { $net.MACAddress } else { $null }; user = $cs.UserName; lastBoot = Iso $os.LastBootUpTime
+    cpuPct = if ($null -ne $load) { [math]::Round($load) } else { $null }
+    memPct = [math]::Round(100 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100))
+    agentVersion = $AgentVersion
+  }
+}
+
+function Get-Security {
+  $s = [ordered]@{ encrypted = $null; avOn = $null; fwOn = $null; defsAgeDays = $null; screenLockMin = $null; usbBlocked = $null; pendingReboot = $false; localAdmins = $null }
+  try {
+    $v = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction Stop
+    $s.encrypted = [bool]($v -and [int]$v.ProtectionStatus -eq 1)
+  } catch { }
+  try {
+    $mp = Get-MpComputerStatus -ErrorAction Stop
+    $s.avOn = [bool]$mp.RealTimeProtectionEnabled
+    $s.defsAgeDays = [int]$mp.AntivirusSignatureAge
+  } catch {
+    try {
+      $av = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop)
+      if ($av.Count) { $s.avOn = [bool](@($av | Where-Object { (([int]$_.productState -shr 12) -band 0xF) -eq 1 }).Count) }
+    } catch { }
+  }
+  try { $s.fwOn = -not @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { "$($_.Enabled)" -ne 'True' }).Count } catch { }
+  $t = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name InactivityTimeoutSecs -ErrorAction SilentlyContinue).InactivityTimeoutSecs
+  $s.screenLockMin = if ($t) { [math]::Ceiling($t / 60) } else { 0 }
+  $usb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR' -Name Start -ErrorAction SilentlyContinue).Start
+  $s.usbBlocked = ($usb -eq 4)
+  $s.pendingReboot = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+  try { $s.localAdmins = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { "$($_.Name)" }) } catch {
+    try {
+      $name = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+      $g = [ADSI]"WinNT://$env:COMPUTERNAME/$name,group"
+      $s.localAdmins = @($g.psbase.Invoke('Members') | ForEach-Object { $_.GetType().InvokeMember('Name', 'GetProperty', $null, $_, $null) })
+    } catch { }
+  }
+  return $s
+}
+
+function Get-Software {
+  $paths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'Registry::HKEY_USERS\*\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+  $seen = @{}
+  foreach ($p in $paths) {
+    foreach ($e in @(Get-ItemProperty $p -ErrorAction SilentlyContinue)) {
+      if (-not $e.DisplayName -or $e.SystemComponent -eq 1 -or $e.ParentKeyName) { continue }
+      $key = "$($e.DisplayName)|$($e.DisplayVersion)"
+      if (-not $seen.ContainsKey($key)) {
+        $seen[$key] = [ordered]@{ name = "$($e.DisplayName)".Trim(); version = "$($e.DisplayVersion)"; publisher = "$($e.Publisher)"; uninstall = "$($e.QuietUninstallString)"; uninstallString = "$($e.UninstallString)" }
+      }
+    }
+  }
+  return @($seen.Values | Sort-Object { $_.name })
+}
+function Test-Detected($DetectName, $Software) {
+  if (-not $DetectName) { return $false }
+  return [bool](@($Software | Where-Object { $_.name -like "*$DetectName*" }).Count)
+}
+
+# ---------------------------------------------------------------- Windows Update
+function Convert-Update($u) {
+  $kb = if ($u.KBArticleIDs.Count -gt 0) { 'KB' + $u.KBArticleIDs.Item(0) } else { $null }
+  $class = $null; $product = $null
+  foreach ($c in $u.Categories) { if ($c.Type -eq 'UpdateClassification' -and -not $class) { $class = $c.Name } elseif ($c.Type -eq 'Product' -and -not $product) { $product = $c.Name } }
+  $sev = "$($u.MsrcSeverity)"
+  if (-not $sev) { $sev = switch ($class) { 'Security Updates' { 'Important' } 'Critical Updates' { 'Important' } 'Definition Updates' { 'Moderate' } default { 'Low' } } }
+  $id = if ($kb) { $kb } else { "$($u.Identity.UpdateID)" }
+  return [ordered]@{
+    id = $id; kb = if ($kb) { $kb } else { $id }; title = "$($u.Title)"; classification = $class; product = $product; severity = $sev
+    sizeMB = [math]::Round($u.MaxDownloadSize / 1MB); reboot = ($u.InstallationBehavior.RebootBehavior -ne 0); released = Iso $u.LastDeploymentChangeTime
+  }
+}
+function Get-UpdateScan {
+  $session = New-Object -ComObject Microsoft.Update.Session
+  $result = $session.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+  $missing = @(); foreach ($u in $result.Updates) { $missing += Convert-Update $u }
+  $installed = @(Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.HotFixID -match '^KB\d+' } | ForEach-Object {
+    $when = $null; try { $when = Iso $_.InstalledOn } catch { }
+    [ordered]@{ id = $_.HotFixID; kb = $_.HotFixID; title = "$($_.Description) $($_.HotFixID)"; installedAt = $when } })
+  return [ordered]@{ scannedAt = Iso (Get-Date); missing = $missing; installed = $installed }
+}
+function Install-Updates($Ids) {
+  $session = New-Object -ComObject Microsoft.Update.Session
+  $result = $session.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+  $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+  foreach ($u in $result.Updates) {
+    if ($Ids -contains (Convert-Update $u).id) { if (-not $u.EulaAccepted) { $u.AcceptEula() }; [void]$coll.Add($u) }
+  }
+  if ($coll.Count -eq 0) { return @{ ok = $true; reboot = $false; message = 'Already installed' } }
+  $dl = $session.CreateUpdateDownloader(); $dl.Updates = $coll; [void]$dl.Download()
+  $inst = $session.CreateUpdateInstaller(); $inst.Updates = $coll
+  $r = $inst.Install()
+  $ok = ($r.ResultCode -eq 2 -or $r.ResultCode -eq 3)
+  return @{ ok = $ok; reboot = [bool]$r.RebootRequired; code = ('0x{0:X8}' -f $r.HResult); message = "Installed $($coll.Count) update(s), result code $($r.ResultCode)" }
+}
+
+# ---------------------------------------------------------------- running things
+function Invoke-Process([string]$File, [string[]]$Arguments, [int]$TimeoutSec = 3600) {
+  $out = Join-Path $env:TEMP ("ggt-" + [guid]::NewGuid() + '.out')
+  $err = "$out.err"
+  $sp = @{ FilePath = $File; PassThru = $true; NoNewWindow = $true; RedirectStandardOutput = $out; RedirectStandardError = $err }
+  if ($Arguments -and $Arguments.Count) { $sp.ArgumentList = $Arguments }
+  $p = Start-Process @sp
+  $null = $p.Handle # keeps ExitCode available after the process ends
+  $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
+  if ($timedOut) { try { $p.Kill() } catch { } }
+  $text = ''
+  foreach ($f in @($out, $err)) { if (Test-Path $f) { $text += (Get-Content $f -Raw -ErrorAction SilentlyContinue); Remove-Item $f -Force -ErrorAction SilentlyContinue } }
+  if ($text.Length -gt 60000) { $text = $text.Substring(0, 60000) + "`n…(output cut at 60 KB)" }
+  return @{ exitCode = if ($timedOut) { -1 } else { $p.ExitCode }; output = "$text".TrimEnd(); timedOut = $timedOut }
+}
+function Invoke-PowerShellText([string]$Body, [int]$TimeoutSec = 600) {
+  $file = Join-Path $env:TEMP ("ggt-" + [guid]::NewGuid() + '.ps1')
+  Set-Content -Path $file -Value $Body -Encoding UTF8
+  try { return Invoke-Process 'powershell.exe' @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$file`"") $TimeoutSec }
+  finally { Remove-Item $file -Force -ErrorAction SilentlyContinue }
+}
+function Find-Winget {
+  $w = Get-Command winget.exe -ErrorAction SilentlyContinue
+  if ($w) { return $w.Source }
+  $p = @(Resolve-Path "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue | Sort-Object { $_.Path })
+  if ($p.Count) { return $p[-1].Path }
+  return $null
+}
+$OkExit = @(0, 3010, 1641, -1978335189, -1978335135) # success, reboot needed, already installed (winget)
+
+function Install-App($Dep, $Software) {
+  $a = $Dep.app
+  $uninstall = ($Dep.action -eq 'Uninstall')
+  if ($uninstall) {
+    if ($a.uninstall) { $r = Invoke-PowerShellText $a.uninstall 3600 }
+    elseif ($a.wingetId) {
+      $w = Find-Winget; if (-not $w) { return @{ ok = $false; code = 'WINGET'; message = 'winget not found' } }
+      $r = Invoke-Process $w @('uninstall', '--id', $a.wingetId, '--exact', '--silent', '--accept-source-agreements', '--disable-interactivity')
+    } else {
+      $e = @($Software | Where-Object { $_.name -like "*$($a.detectName)*" })[0]
+      if (-not $e) { return @{ ok = $true; message = 'Not installed' } }
+      if ($e.uninstallString -match '\{[0-9A-Fa-f-]{36}\}' -and $e.uninstallString -match 'msiexec') { $r = Invoke-Process 'msiexec.exe' @('/x', $Matches[0], '/qn', '/norestart') }
+      elseif ($e.uninstall) { $r = Invoke-Process 'cmd.exe' @('/c', $e.uninstall) }
+      else { return @{ ok = $false; code = 'NO_METHOD'; message = 'No silent uninstall found. Add an uninstall command in the software library.' } }
+    }
+  } elseif ($a.wingetId) {
+    $w = Find-Winget; if (-not $w) { return @{ ok = $false; code = 'WINGET'; message = 'winget not found on this device' } }
+    $base = @('install', '--id', $a.wingetId, '--exact', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+    $r = Invoke-Process $w ($base + @('--scope', 'machine'))
+    if ($OkExit -notcontains $r.exitCode) { $r = Invoke-Process $w $base }
+  } elseif ($a.url) {
+    $cache = Join-Path $AgentDir 'Cache'
+    if (-not (Test-Path $cache)) { New-Item -ItemType Directory -Path $cache -Force | Out-Null }
+    $leaf = ([uri]$a.url).Segments[-1]; if (-not $leaf -or $leaf -eq '/') { $leaf = 'installer.exe' }
+    $file = Join-Path $cache ([IO.Path]::GetFileName([uri]::UnescapeDataString($leaf)))
+    try { Invoke-WebRequest -Uri $a.url -OutFile $file -UseBasicParsing -TimeoutSec 3600 } catch { return @{ ok = $false; code = 'DOWNLOAD'; message = $_.Exception.Message } }
+    if ($a.sha256 -and (Get-FileHash $file -Algorithm SHA256).Hash -ne $a.sha256.ToUpper()) { Remove-Item $file -Force; return @{ ok = $false; code = 'HASH'; message = 'SHA-256 mismatch' } }
+    if ($file -match '\.msi$') { $r = Invoke-Process 'msiexec.exe' (@('/i', "`"$file`"", '/qn', '/norestart') + @(if ($a.args) { $a.args })) }
+    else { $r = Invoke-Process $file @(if ($a.args) { $a.args }) }
+    Remove-Item $file -Force -ErrorAction SilentlyContinue
+  } elseif ($a.command) {
+    $r = Invoke-PowerShellText $a.command 3600
+  } else { return @{ ok = $false; code = 'NO_METHOD'; message = 'No Windows install method' } }
+  if ($r.timedOut) { return @{ ok = $false; code = 'TIMEOUT'; message = 'Timed out' } }
+  $ok = $OkExit -contains $r.exitCode
+  $msg = if ($ok) { "Exit code $($r.exitCode)" } else { "Exit code $($r.exitCode). " + ("$($r.output)" -split "`n" | Select-Object -Last 3) -join ' ' }
+  return @{ ok = $ok; code = if ($ok) { $null } else { "$($r.exitCode)" }; reboot = ($r.exitCode -eq 3010 -or $r.exitCode -eq 1641); message = $msg }
+}
+
+function Invoke-Remediation($Ids, $Settings, $Sec) {
+  $done = @()
+  $try = { param($label, $sb) try { & $sb; $script:remediated += $label } catch { $script:remediateErrors += "${label}: $($_.Exception.Message)" } }
+  $script:remediated = @(); $script:remediateErrors = @()
+  if ($Ids -contains 'fw' -and $Sec.fwOn -eq $false) { & $try 'Turned the firewall on' { Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True } }
+  if ($Ids -contains 'av' -and $Sec.avOn -eq $false) { & $try 'Turned antivirus real-time protection on' { Set-MpPreference -DisableRealtimeMonitoring $false } }
+  if ($Ids -contains 'defs' -and $Sec.defsAgeDays -ge 3) { & $try 'Updated antivirus definitions' { Update-MpSignature } }
+  $lock = if ($Settings.screenLockMin) { [int]$Settings.screenLockMin } else { 10 }
+  if ($Ids -contains 'lock' -and ($Sec.screenLockMin -eq 0 -or $Sec.screenLockMin -gt $lock)) {
+    & $try "Set screen lock to $lock minutes" { New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name InactivityTimeoutSecs -Value ($lock * 60) -PropertyType DWord -Force | Out-Null }
+  }
+  if ($Ids -contains 'usb' -and $Sec.usbBlocked -eq $false) { & $try 'Blocked USB storage' { Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR' -Name Start -Value 4 } }
+  return @{ done = $script:remediated; errors = $script:remediateErrors }
+}
+
+function Request-Restart {
+  if ($script:restartRequested) { return }
+  $script:restartRequested = $true
+  Write-Log 'Restarting in 5 minutes'
+  & shutdown.exe /r /t 300 /c "Go-Green IT: this computer restarts in 5 minutes to finish installing updates. Save your work." /d p:2:17 | Out-Null
+}
+
+# ---------------------------------------------------------------- one cycle
+function Send-Status($DeploymentId, $State, $Code, $Message) {
+  try { Invoke-Api 'POST' '/api/agent/status' @{ deviceId = $script:Config.deviceId; deploymentId = $DeploymentId; state = $State; errorCode = $Code; message = $Message } | Out-Null }
+  catch { Write-Log $_.Exception.Message 'warn' }
+}
+
+function Invoke-Checkin($Inventory, $Security, $Software, $Updates, $Events, $Errors) {
+  $body = [ordered]@{}
+  foreach ($k in $Inventory.Keys) { $body[$k] = $Inventory[$k] }
+  $body.security = $Security
+  if ($script:Config.deviceId) { $body.deviceId = $script:Config.deviceId }
+  if ($null -ne $Software) { $body.software = @($Software | ForEach-Object { [ordered]@{ name = $_.name; version = $_.version; publisher = $_.publisher } }) }
+  if ($null -ne $Updates) { $body.updates = $Updates }
+  $body.events = @($Events | ForEach-Object { @{ level = 'info'; message = $_ } })
+  $body.errors = @($Errors)
+  try { $r = Invoke-Api 'POST' '/api/agent/checkin' $body } catch {
+    if ($_.Exception.Data['status'] -eq 404 -and $script:Config.deviceId) {
+      Write-Log 'The server no longer knows this device. Enrolling again.' 'warn'
+      $script:Config.deviceId = $null; $script:Config.deviceKey = $null
+      $body.Remove('deviceId')
+      $r = Invoke-Api 'POST' '/api/agent/checkin' $body
+    } else { throw }
+  }
+  if ($r.deviceKey) {
+    $script:Config.deviceId = $r.deviceId; $script:Config.deviceKey = $r.deviceKey
+    Write-Json $ConfigPath $script:Config
+    Write-Log "Enrolled as device $($r.deviceId)"
+  }
+  return $r
+}
+
+function Invoke-Cycle {
+  $script:Config = To-Hash (Read-Json $ConfigPath)
+  if (-not $script:Config.server -or -not $script:Config.token) { throw "Not installed. Run: ggt-agent.ps1 -Install -Server https://<site> -Token <token>" }
+  $state = To-Hash (Read-Json $StatePath)
+  $deps = To-Hash $state.deps
+  $now = Now-Ms
+  $errors = @(); $events = @($state.pendingEvents | Where-Object { $_ })
+
+  $inv = Get-Inventory
+  $sec = Get-Security
+  $sw = Get-Software
+  $swHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes((($sw | ForEach-Object { "$($_.name)|$($_.version)" }) -join "`n")))).Replace('-', '')
+  $sendSw = $state.forceInventory -or $swHash -ne $state.softwareHash -or -not $state.softwareAt -or ($now - [int64]$state.softwareAt) -gt 86400000
+  $upd = $null
+  if (-not $SkipUpdateScan -and ($state.forceScan -or -not $state.lastScan -or ($now - [int64]$state.lastScan) -gt 6 * 3600000)) {
+    try { Write-Log 'Scanning Windows Update'; $upd = Get-UpdateScan; $state.lastScan = $now; $state.forceScan = $false; Write-Log "$(@($upd.missing).Count) updates missing" }
+    catch { $errors += "Windows Update scan failed: $($_.Exception.Message)" }
+  }
+  $r = Invoke-Checkin $inv $sec $(if ($sendSw) { $sw } else { $null }) $upd $events $errors
+  if ($sendSw) { $state.softwareHash = $swHash; $state.softwareAt = $now; $state.forceInventory = $false }
+  $state.pendingEvents = @()
+  $newEvents = @()
+
+  $policy = Invoke-Api 'GET' "/api/agent/policy?deviceId=$([uri]::EscapeDataString($script:Config.deviceId))" $null
+  $changed = $false
+
+  foreach ($c in @($policy.commands)) {
+    if (-not $c) { continue }
+    Write-Log "Running command $($c.type) $($c.name)"
+    $res = @{ status = 'succeeded'; exitCode = 0; output = '' }
+    try {
+      switch ($c.type) {
+        'script' {
+          if ($c.lang -ne 'PowerShell') { $res = @{ status = 'failed'; exitCode = $null; output = "$($c.lang) scripts don't run on Windows" }; break }
+          $p = Invoke-PowerShellText $c.body 600
+          $res = @{ status = if ($p.exitCode -eq 0) { 'succeeded' } else { 'failed' }; exitCode = $p.exitCode; output = if ($p.timedOut) { "$($p.output)`nStopped after 10 minutes." } else { $p.output } }
+        }
+        'restart' { Request-Restart; $res.output = 'Restart scheduled in 5 minutes' }
+        'inventory' { $state.forceInventory = $true; $changed = $true; $res.output = 'Inventory sent' }
+        'updscan' { $state.forceScan = $true; $changed = $true; $res.output = 'Update scan started' }
+        default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
+      }
+    } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }
+    try { Invoke-Api 'POST' '/api/agent/result' @{ deviceId = $script:Config.deviceId; commandId = $c.id; status = $res.status; exitCode = $res.exitCode; output = "$($res.output)" } | Out-Null } catch { Write-Log $_.Exception.Message 'warn' }
+  }
+
+  if (@($policy.remediate).Count) {
+    $rem = Invoke-Remediation @($policy.remediate) $policy.settings $sec
+    if ($rem.done.Count) { $newEvents += $rem.done; $changed = $true }
+    foreach ($e in $rem.errors) { $newEvents += "Remediation failed: $e" }
+  }
+
+  foreach ($d in @($policy.deployments)) {
+    if (-not $d) { continue }
+    $prev = To-Hash $deps[$d.id]
+    if ($d.kind -eq 'app') {
+      $want = $d.action -ne 'Uninstall'
+      if ((Test-Detected $d.app.detectName $sw) -eq $want) {
+        if ($prev.state -ne 'success') { Send-Status $d.id 'success' $null 'Detected'; $deps[$d.id] = @{ state = 'success'; at = $now } }
+        continue
+      }
+    }
+    if (-not $d.allowedNow) { continue }
+    if ($prev.state -eq 'error' -and [int64]$prev.at -gt [int64]$d.retryAt -and ($now - [int64]$prev.at) -lt 86400000) { continue }
+    Send-Status $d.id 'inprogress' $null $null
+    Write-Log "Deployment $($d.name): starting"
+    try {
+      if ($d.kind -eq 'app') {
+        $res = Install-App $d $sw
+        $sw = Get-Software
+        if ($res.ok -and (Test-Detected $d.app.detectName $sw) -ne ($d.action -ne 'Uninstall')) { $res = @{ ok = $false; code = 'NOT_DETECTED'; message = $res.message } }
+      } else {
+        $res = Install-Updates @($d.updateIds)
+        $state.forceScan = $true
+      }
+    } catch { $res = @{ ok = $false; code = 'ERROR'; message = $_.Exception.Message } }
+    $changed = $true
+    if ($res.ok) { Send-Status $d.id 'success' $null $res.message; $deps[$d.id] = @{ state = 'success'; at = (Now-Ms) } }
+    else { Send-Status $d.id 'error' $res.code $res.message; $deps[$d.id] = @{ state = 'error'; at = (Now-Ms) } }
+    Write-Log "Deployment $($d.name): $(if ($res.ok) { 'succeeded' } else { "failed $($res.code) $($res.message)" })"
+    if ($res.reboot -and $d.restart -eq 'Allow') { Request-Restart }
+  }
+
+  # Report what changed right away instead of waiting 5 minutes.
+  if ($changed) {
+    $upd2 = $null
+    if ($state.forceScan -and -not $SkipUpdateScan) { try { $upd2 = Get-UpdateScan; $state.lastScan = Now-Ms; $state.forceScan = $false } catch { $errors += "Windows Update scan failed: $($_.Exception.Message)" } }
+    $sw = Get-Software
+    try { Invoke-Checkin (Get-Inventory) (Get-Security) $sw $upd2 $newEvents $errors | Out-Null; $newEvents = @(); $state.softwareAt = Now-Ms; $state.forceInventory = $false } catch { Write-Log $_.Exception.Message 'warn' }
+  }
+  $state.pendingEvents = @($newEvents)
+  $state.deps = $deps
+  Write-Json $StatePath $state
+}
+
+# ---------------------------------------------------------------- install / uninstall
+function Assert-Admin {
+  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+  if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run PowerShell as administrator.' }
+}
+
+if ($Install) {
+  Assert-Admin
+  $Server = $Server.TrimEnd('/')
+  if ($Server -notmatch '^https://' -and $Server -notmatch '^http://(localhost|127\.0\.0\.1)(:\d+)?$') { throw 'Server must be an https:// address.' }
+  if (-not (Test-Path $AgentDir)) { New-Item -ItemType Directory -Path $AgentDir -Force | Out-Null }
+  $target = Join-Path $AgentDir 'ggt-agent.ps1'
+  if ($PSCommandPath -ne $target) { Copy-Item -Path $PSCommandPath -Destination $target -Force }
+  & icacls.exe $AgentDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+  $old = To-Hash (Read-Json $ConfigPath)
+  $cfg = @{ server = $Server; token = $Token; deviceId = $null; deviceKey = $null }
+  if ($old.server -eq $Server -and $old.deviceId) { $cfg.deviceId = $old.deviceId; $cfg.deviceKey = $old.deviceKey }
+  Write-Json $ConfigPath $cfg
+  if (-not $NoSchedule) {
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$target`" -Run"
+    $triggers = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 5)))
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+    Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Log "Scheduled task $TaskPath$TaskName registered (every 5 minutes, as SYSTEM)"
+  }
+  Write-Log "Installed agent $AgentVersion in $AgentDir. Checking in now."
+  Invoke-Cycle
+  Write-Log 'First check-in done. The device now shows in the Device Manager.'
+  exit 0
+}
+
+if ($Uninstall) {
+  Assert-Admin
+  Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-Item -Path $AgentDir -Recurse -Force -ErrorAction SilentlyContinue
+  Write-Host 'GGT Agent removed. Retire the device in the Device Manager to remove its record.'
+  exit 0
+}
+
+try { Invoke-Cycle; exit 0 } catch { Write-Log $_.Exception.Message 'error'; exit 1 }
