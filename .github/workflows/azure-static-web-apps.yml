@@ -26,9 +26,74 @@ jobs:
       - run: npm --prefix api install --omit=dev
       - run: npm test
 
+  # Runs the real agent on real Windows, macOS and Ubuntu machines against a local copy of the API:
+  # enrol, inventory, deploy and remove an app, run a script, then install and remove the 5-minute schedule.
+  agent:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: 20 }
+      - name: Agent end to end
+        run: node scripts/agent-e2e.js
+        env:
+          E2E_UPDATE_SCAN: ${{ matrix.os == 'windows-latest' && '0' || '1' }}
+      - name: Install with schedule, then uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:PORT = '4290'
+          $server = Start-Process node -ArgumentList 'dev-server.js' -PassThru -NoNewWindow
+          Start-Sleep -Seconds 3
+          .\app\agent\ggt-agent.ps1 -Install -Server http://localhost:4290 -Token dev-token -SkipUpdateScan
+          if ($LASTEXITCODE -ne 0) { throw 'install failed' }
+          $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
+          "Task: $($t.TaskName) as $($t.Principal.UserId), state $($t.State)"
+          Start-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
+          Start-Sleep -Seconds 60
+          $info = Get-ScheduledTaskInfo -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
+          "Scheduled run as SYSTEM finished with $($info.LastTaskResult)"
+          Get-Content "$env:ProgramData\GGT Agent\Logs\agent.log" -Tail 15
+          .\app\agent\ggt-agent.ps1 -Uninstall
+          if (Get-ScheduledTask -TaskPath '\Go-Green\' -ErrorAction SilentlyContinue) { throw 'task not removed' }
+          if (Test-Path "$env:ProgramData\GGT Agent") { throw 'folder not removed' }
+          Stop-Process -Id $server.Id
+      - name: Install with schedule, then uninstall (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          PORT=4290 node dev-server.js & SERVER=$!
+          sleep 3
+          sudo python3 app/agent/ggt-agent.py install --server http://localhost:4290 --token dev-token --skip-update-scan
+          if [ "$RUNNER_OS" = "Linux" ]; then systemctl list-timers ggt-agent.timer --no-pager; sudo systemctl start ggt-agent.service; sudo tail -5 /var/log/ggt-agent.log; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then sudo launchctl list | grep com.go-green.ggt-agent; sleep 20; sudo tail -5 /Library/Logs/ggt-agent.log; fi
+          sudo python3 app/agent/ggt-agent.py uninstall
+          if [ "$RUNNER_OS" = "Linux" ] && [ -e /etc/systemd/system/ggt-agent.timer ]; then echo "timer not removed"; exit 1; fi
+          if [ "$RUNNER_OS" = "macOS" ] && [ -e /Library/LaunchDaemons/com.go-green.ggt-agent.plist ]; then echo "launchd job not removed"; exit 1; fi
+          kill $SERVER
+
+  # Windows Update scans can take a long time on fresh runners, so this check doesn't block deploys.
+  agent_windows_update_scan:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: 20 }
+      - run: node scripts/agent-e2e.js
+        env:
+          E2E_UPDATE_SCAN: '1'
+
   build_and_deploy:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: test
+    needs: [test, agent]
     runs-on: ubuntu-latest
     name: Build and deploy
     env:

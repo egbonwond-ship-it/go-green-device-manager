@@ -3,13 +3,13 @@ const { handle } = require('../lib/router');
 
 // One HTTP function serves every /api/* route; routing happens in lib/router.js.
 app.http('api', {
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
   authLevel: 'anonymous',
   route: '{*path}',
   handler: async (request) => {
     const url = new URL(request.url);
     let body = {};
-    if (request.method === 'POST') { try { body = await request.json(); } catch { body = {}; } }
+    if (request.method === 'POST' || request.method === 'PUT') { try { body = await request.json(); } catch { body = {}; } }
     const out = await handle({
       method: request.method,
       path: url.pathname,
