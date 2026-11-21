@@ -52,7 +52,7 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
   if (route === 'GET /api/health') {
     let devicesKnown = null, storageOk = true;
     try { devicesKnown = await db.countDevices(); } catch (e) { storageOk = false; console.error('storage', e.message); }
-    return { status: storageOk ? 200 : 503, body: { status: storageOk ? 'ok' : 'storage-unavailable', version: VERSION, agentsCheckedIn: stats.checkins, devicesKnown, since: stats.started, storage: db.kind } };
+    return { status: storageOk ? 200 : 503, body: { status: storageOk ? 'ok' : 'storage-unavailable', version: VERSION, agentsCheckedIn: stats.checkins, devicesKnown, since: stats.started, storage: db.kind, ...(db.kind === 'memory' ? { databaseSettingsSeen: Object.keys(process.env).filter(k => /postgres|database|sql|cosmos|supabase/i.test(k)) } : {}) } };
   }
   if (path.startsWith('/api/agent/')) {
     if (!tokenOk(headers)) return { status: 401, body: { error: 'Missing or invalid x-ggt-enroll-token header' } };
