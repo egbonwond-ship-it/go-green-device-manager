@@ -52,8 +52,10 @@ jobs:
           $server = Start-Process node -ArgumentList 'dev-server.js' -PassThru -NoNewWindow
           Start-Sleep -Seconds 3
           node scripts/make-setup.mjs windows http://localhost:4290 dev-token "$env:RUNNER_TEMP\GoGreenAgentSetup.cmd"
-          # The setup elevates itself into a new window that waits for Enter at the end, so don't wait on it.
-          cmd /c "$env:RUNNER_TEMP\GoGreenAgentSetup.cmd"
+          # The runner is already an administrator, so the setup runs in place; "< nul" answers its final "press a key".
+          $env:SETUP = "$env:RUNNER_TEMP\GoGreenAgentSetup.cmd"
+          cmd /c '%SETUP% < nul'
+          if ($LASTEXITCODE -ne 0) { throw "setup file exited with $LASTEXITCODE" }
           $t = $null
           for ($i = 0; $i -lt 60 -and -not $t; $i++) { Start-Sleep -Seconds 5; $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent' -ErrorAction SilentlyContinue }
           if (-not $t) { throw 'setup file did not install the agent' }
