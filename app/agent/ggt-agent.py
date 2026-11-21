@@ -14,6 +14,8 @@ settings, scans for OS updates every 6 hours, checks in, pulls its policy, runs 
 and actions, installs or removes deployed software, installs approved updates and reports back.
 """
 import argparse
+import contextlib
+import fcntl
 import glob
 import hashlib
 import json
@@ -32,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.0.0'
+AGENT_VERSION = '2.0.1'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -560,6 +562,10 @@ def cycle(skip_scan=False):
     sw_hash = hashlib.sha256('\n'.join('%s|%s' % (s['name'], s['version']) for s in sw).encode()).hexdigest()
     send_sw = state.get('forceInventory') or sw_hash != state.get('softwareHash') or now - state.get('softwareAt', 0) > 86400000
     upd = None
+    # A new device checks in before its first (slow) update scan, so it shows in the console at once.
+    if not CONFIG.get('deviceId'):
+        checkin(inv, sec, sw, None, events, errors)
+        events = []
     if not skip_scan and (state.get('forceScan') or now - state.get('lastScan', 0) > 6 * 3600000):
         try:
             log('Scanning for updates')
@@ -725,6 +731,21 @@ def unschedule():
     sh(['systemctl', 'daemon-reload'])
 
 
+@contextlib.contextmanager
+def run_lock(wait):
+    """One agent run at a time (scheduled runs and a manual install or run)."""
+    f = open(os.path.join(HOME, 'run.lock'), 'a')
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            got = True
+        except BlockingIOError:
+            got = False
+        yield got
+    finally:
+        f.close()
+
+
 def main():
     global HOME, LOG_PATH, CONFIG
     ap = argparse.ArgumentParser(description='Go-Green Device Manager agent')
@@ -759,11 +780,14 @@ def main():
         if old.get('server') == server and old.get('deviceId'):
             CONFIG['deviceId'], CONFIG['deviceKey'] = old['deviceId'], old.get('deviceKey')
         write_json(cfg_path, CONFIG)
+        # Check in before scheduling, so a scheduled run (launchd starts one at once) can't
+        # enrol at the same time and replace this run's device key.
+        log('Installed agent %s in %s. Checking in now.' % (AGENT_VERSION, HOME))
+        with run_lock(wait=True):
+            cycle(a.skip_update_scan)
+        log('First check-in done. The device now shows in the Device Manager.')
         if not a.no_schedule:
             log('Scheduled with ' + schedule(target))
-        log('Installed agent %s in %s. Checking in now.' % (AGENT_VERSION, HOME))
-        cycle(a.skip_update_scan)
-        log('First check-in done. The device now shows in the Device Manager.')
         return
     if a.command == 'uninstall':
         unschedule()
@@ -774,7 +798,11 @@ def main():
     if not CONFIG.get('server') or not CONFIG.get('token'):
         sys.exit('Not installed. Run: ggt-agent.py install --server https://<site> --token <token>')
     try:
-        cycle(a.skip_update_scan)
+        with run_lock(wait=False) as got:
+            if not got:
+                log('Another agent run is still in progress; skipping this one.')
+                return
+            cycle(a.skip_update_scan)
     except Exception as e:  # noqa: BLE001 - logged for the admin
         log(str(e), 'error')
         sys.exit(1)

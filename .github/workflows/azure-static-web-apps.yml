@@ -44,15 +44,23 @@ jobs:
         run: node scripts/agent-e2e.js
         env:
           E2E_UPDATE_SCAN: ${{ matrix.os == 'windows-latest' && '0' || '1' }}
-      - name: Install with schedule, then uninstall (Windows)
+      - name: Install with the downloadable setup file and schedule, then uninstall (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           $env:PORT = '4290'
           $server = Start-Process node -ArgumentList 'dev-server.js' -PassThru -NoNewWindow
           Start-Sleep -Seconds 3
-          .\app\agent\ggt-agent.ps1 -Install -Server http://localhost:4290 -Token dev-token -SkipUpdateScan
-          if ($LASTEXITCODE -ne 0) { throw 'install failed' }
+          node scripts/make-setup.mjs windows http://localhost:4290 dev-token "$env:RUNNER_TEMP\GoGreenAgentSetup.cmd"
+          # The setup elevates itself into a new window that waits for Enter at the end, so don't wait on it.
+          cmd /c "$env:RUNNER_TEMP\GoGreenAgentSetup.cmd"
+          $t = $null
+          for ($i = 0; $i -lt 60 -and -not $t; $i++) { Start-Sleep -Seconds 5; $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent' -ErrorAction SilentlyContinue }
+          if (-not $t) { throw 'setup file did not install the agent' }
+          $devices = @()
+          for ($i = 0; $i -lt 24 -and $devices.Count -lt 1; $i++) { Start-Sleep -Seconds 5; $devices = @((Invoke-RestMethod http://localhost:4290/api/console/state).devices) }
+          if ($devices.Count -ne 1) { throw "expected 1 enrolled device, got $($devices.Count)" }
+          "Enrolled by setup file: $($devices[0].name)"
           $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
           "Task: $($t.TaskName) as $($t.Principal.UserId), state $($t.State)"
           Start-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
@@ -64,12 +72,14 @@ jobs:
           if (Get-ScheduledTask -TaskPath '\Go-Green\' -ErrorAction SilentlyContinue) { throw 'task not removed' }
           if (Test-Path "$env:ProgramData\GGT Agent") { throw 'folder not removed' }
           Stop-Process -Id $server.Id
-      - name: Install with schedule, then uninstall (macOS / Linux)
+      - name: Install with the downloadable setup file and schedule, then uninstall (macOS / Linux)
         if: runner.os != 'Windows'
         run: |
           PORT=4290 node dev-server.js & SERVER=$!
           sleep 3
-          sudo python3 app/agent/ggt-agent.py install --server http://localhost:4290 --token dev-token --skip-update-scan
+          node scripts/make-setup.mjs unix http://localhost:4290 dev-token "$RUNNER_TEMP/go-green-agent-setup.sh"
+          sudo sh "$RUNNER_TEMP/go-green-agent-setup.sh"
+          curl -fsS http://localhost:4290/api/console/state | node -e "const s=JSON.parse(require('fs').readFileSync(0));if(s.devices.length!==1)throw new Error('expected 1 device, got '+s.devices.length);console.log('Enrolled by setup file:',s.devices[0].name)"
           if [ "$RUNNER_OS" = "Linux" ]; then systemctl list-timers ggt-agent.timer --no-pager; sudo systemctl start ggt-agent.service; sudo tail -5 /var/log/ggt-agent.log; fi
           if [ "$RUNNER_OS" = "macOS" ]; then sudo launchctl list | grep com.go-green.ggt-agent; sleep 20; sudo tail -5 /Library/Logs/ggt-agent.log; fi
           sudo python3 app/agent/ggt-agent.py uninstall

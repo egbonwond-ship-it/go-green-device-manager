@@ -1,4 +1,5 @@
 import * as S from '../store.js';
+import { windowsSetup, unixSetup, saveFile } from '../agent-setup.js';
 import { esc, fmtN, ago, fmtDate, fmtDay, badge, table, drawer, modal, toast, meter, statusDot, ICON, downloadCsv, confirmBox } from '../ui.js';
 
 const FILTERS = [
@@ -51,16 +52,28 @@ export async function enrolHelp() {
   let token = null;
   try { token = (await S.enrollment()).token; } catch (e) { toast(e.message, true); }
   const tok = token ? esc(token) : '&lt;AGENT_ENROLL_TOKEN&gt;';
-  m.el.querySelector('.modal-body').innerHTML = `<p>Install the Go-Green agent on each computer. It checks in every 5 minutes, sends its inventory, installs what you deploy, applies updates and runs your scripts. The device appears here after its first check-in.</p>
+  const winCmd = `Invoke-WebRequest ${origin}/agent/ggt-agent.ps1 -OutFile $env:TEMP\\ggt-agent.ps1 -UseBasicParsing; powershell -ExecutionPolicy Bypass -File $env:TEMP\\ggt-agent.ps1 -Install -Server ${origin} -Token '${token || '<AGENT_ENROLL_TOKEN>'}'`;
+  const nixCmd = `curl -fsSL ${origin}/agent/ggt-agent.py -o /tmp/ggt-agent.py && sudo python3 /tmp/ggt-agent.py install --server ${origin} --token '${token || '<AGENT_ENROLL_TOKEN>'}'`;
+  const dl = (id, label) => token ? `<button class="btn primary" id="${id}">${label}</button>` : '';
+  m.el.querySelector('.modal-body').innerHTML = `<p>Install the GO-Green agent on each computer. It checks in every 5 minutes, sends its inventory, installs what you deploy, applies updates and runs your scripts. The device appears here after its first check-in.</p>
     ${token ? '' : '<div class="notice" style="margin:10px 0">The server has no <span class="mono">AGENT_ENROLL_TOKEN</span> setting, so agents can’t enrol yet. Add it under the Static Web App’s Environment variables.</div>'}
     <h3 style="margin:14px 0 6px">Windows 10, 11 and Server 2016 or later</h3>
-    <p class="small muted">In PowerShell opened as administrator. It installs to <span class="mono">C:\\ProgramData\\GGT Agent</span> and runs as SYSTEM from a scheduled task.</p>
-    <div class="console">Invoke-WebRequest ${esc(origin)}/agent/ggt-agent.ps1 -OutFile $env:TEMP\\ggt-agent.ps1 -UseBasicParsing; powershell -ExecutionPolicy Bypass -File $env:TEMP\\ggt-agent.ps1 -Install -Server ${esc(origin)} -Token '${tok}'</div>
-    <p class="small muted" style="margin-top:6px">For many PCs, run the same command from Intune (platform script), a GPO startup script or your RMM tool.</p>
+    <div class="actions" style="margin:6px 0">${dl('dl-win', 'Download Windows setup')}</div>
+    <p class="small muted">Double-click <span class="mono">GoGreenAgentSetup.cmd</span> and select Yes at the administrator prompt. If SmartScreen warns about it, choose More info, then Run anyway. It installs to <span class="mono">C:\\ProgramData\\GGT Agent</span> and runs as SYSTEM from a scheduled task.</p>
+    <p class="small muted" style="margin-top:6px">Or paste this into PowerShell opened as administrator. For many PCs, run it from Intune (platform script), a GPO startup script or your RMM tool.</p>
+    <div class="console">${esc(winCmd)}</div><div class="actions" style="margin-top:6px"><button class="btn" id="cp-win">Copy command</button></div>
     <h3 style="margin:14px 0 6px">macOS and Linux</h3>
-    <p class="small muted">Needs Python 3 (built into most Linux; on macOS install the Xcode Command Line Tools). Runs as root from launchd or a systemd timer.</p>
-    <div class="console">curl -fsSL ${esc(origin)}/agent/ggt-agent.py -o /tmp/ggt-agent.py && sudo python3 /tmp/ggt-agent.py install --server ${esc(origin)} --token '${tok}'</div>
-    <p class="small muted" style="margin-top:12px">Keep the token private: anyone with it can enrol a device. To change it, set a new <span class="mono">AGENT_ENROLL_TOKEN</span> and reinstall the agents. To remove the agent, run the same script with <span class="mono">-Uninstall</span> or <span class="mono">uninstall</span>.</p>`;
+    <div class="actions" style="margin:6px 0">${dl('dl-nix', 'Download macOS / Linux setup')}</div>
+    <p class="small muted">Then in Terminal run <span class="mono">sudo sh ~/Downloads/go-green-agent-setup.sh</span> and enter your password. Needs Python 3 (built into most Linux; on macOS the setup tells you how to add it). Runs as root from launchd or a systemd timer.</p>
+    <p class="small muted" style="margin-top:6px">Or run this in Terminal:</p>
+    <div class="console">${esc(nixCmd)}</div><div class="actions" style="margin-top:6px"><button class="btn" id="cp-nix">Copy command</button></div>
+    <p class="small muted" style="margin-top:12px">The setup files and commands contain the enrollment token. Keep them private: anyone with it can enrol a device. To change it, set a new <span class="mono">AGENT_ENROLL_TOKEN</span> and reinstall the agents. To remove the agent, run the script with <span class="mono">-Uninstall</span> or <span class="mono">uninstall</span>.</p>`;
+  const on = (id, fn) => m.el.querySelector('#' + id)?.addEventListener('click', fn);
+  on('dl-win', () => saveFile('GoGreenAgentSetup.cmd', windowsSetup(origin, token)));
+  on('dl-nix', () => saveFile('go-green-agent-setup.sh', unixSetup(origin, token)));
+  const copy = text => navigator.clipboard.writeText(text).then(() => toast('Copied'), () => toast('Couldn’t copy. Select the text instead.', true));
+  on('cp-win', () => copy(winCmd));
+  on('cp-nix', () => copy(nixCmd));
 }
 
 const TABS = ['Summary', 'Software', 'Updates', 'Compliance', 'Deployments', 'Collections'];

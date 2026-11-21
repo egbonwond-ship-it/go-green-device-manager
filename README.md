@@ -52,6 +52,8 @@ Without a database setting the API keeps data in memory, which is lost on restar
 
 ## Enrol devices
 
+The easiest way: in the console open **Devices → Enrol devices** and select **Download Windows setup** or **Download macOS / Linux setup**. The file has this site's address and the enrollment token built in (keep it private). On Windows double-click `GoGreenAgentSetup.cmd` and approve the administrator prompt; on macOS or Linux run `sudo sh ~/Downloads/go-green-agent-setup.sh`. Or use the commands below.
+
 **Windows 10/11, Server 2016+** (PowerShell as administrator; runs every 5 minutes as SYSTEM from the scheduled task `\Go-Green\GGT Agent`):
 ```powershell
 Invoke-WebRequest https://<site>/agent/ggt-agent.ps1 -OutFile $env:TEMP\ggt-agent.ps1 -UseBasicParsing
@@ -108,6 +110,7 @@ app/                       Console (deployed as-is)
   index.html, login.html, styles.css, logo-*.svg, staticwebapp.config.json
   js/store.js              Console state from the API, collection and compliance rules
   js/ui.js                 Tables, modals, drawers, charts
+  js/agent-setup.js        Downloadable agent setup files (Windows .cmd, macOS/Linux .sh)
   js/views/*.js            One file per page
   agent/ggt-agent.ps1      Windows agent
   agent/ggt-agent.py       macOS and Linux agent

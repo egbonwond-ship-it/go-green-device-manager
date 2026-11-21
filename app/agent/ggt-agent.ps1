@@ -29,7 +29,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.0.0'
+$AgentVersion = '2.0.1'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -347,6 +347,8 @@ function Invoke-Cycle {
   $swHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes((($sw | ForEach-Object { "$($_.name)|$($_.version)" }) -join "`n")))).Replace('-', '')
   $sendSw = $state.forceInventory -or $swHash -ne $state.softwareHash -or -not $state.softwareAt -or ($now - [int64]$state.softwareAt) -gt 86400000
   $upd = $null
+  # A new device checks in before its first (slow) update scan, so it shows in the console at once.
+  if (-not $script:Config.deviceId) { Invoke-Checkin $inv $sec $sw $null $events $errors | Out-Null; $events = @() }
   if (-not $SkipUpdateScan -and ($state.forceScan -or -not $state.lastScan -or ($now - [int64]$state.lastScan) -gt 6 * 3600000)) {
     try { Write-Log 'Scanning Windows Update'; $upd = Get-UpdateScan; $state.lastScan = $now; $state.forceScan = $false; Write-Log "$(@($upd.missing).Count) updates missing" }
     catch { $errors += "Windows Update scan failed: $($_.Exception.Message)" }
@@ -434,6 +436,17 @@ function Assert-Admin {
   if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run PowerShell as administrator.' }
 }
 
+# One agent run at a time: a scheduled run that starts while another (for example the first
+# check-in during install) is still going would otherwise enrol again and replace its device key.
+function Invoke-CycleLocked([int]$WaitSeconds = 0) {
+  $mutex = New-Object System.Threading.Mutex($false, 'Global\GGTAgentRun')
+  try {
+    try { $got = $mutex.WaitOne([TimeSpan]::FromSeconds($WaitSeconds)) } catch [System.Threading.AbandonedMutexException] { $got = $true }
+    if (-not $got) { Write-Log 'Another agent run is still in progress; skipping this one.'; return }
+    try { Invoke-Cycle } finally { $mutex.ReleaseMutex() }
+  } finally { $mutex.Dispose() }
+}
+
 if ($Install) {
   Assert-Admin
   $Server = $Server.TrimEnd('/')
@@ -455,7 +468,7 @@ if ($Install) {
     Write-Log "Scheduled task $TaskPath$TaskName registered (every 5 minutes, as SYSTEM)"
   }
   Write-Log "Installed agent $AgentVersion in $AgentDir. Checking in now."
-  Invoke-Cycle
+  Invoke-CycleLocked 600
   Write-Log 'First check-in done. The device now shows in the Device Manager.'
   exit 0
 }
@@ -468,4 +481,4 @@ if ($Uninstall) {
   exit 0
 }
 
-try { Invoke-Cycle; exit 0 } catch { Write-Log $_.Exception.Message 'error'; exit 1 }
+try { Invoke-CycleLocked; exit 0 } catch { Write-Log $_.Exception.Message 'error'; exit 1 }
