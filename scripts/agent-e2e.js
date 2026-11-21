@@ -32,8 +32,16 @@ function agent(...args) {
   process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
   assert.equal(r.status, 0, `agent exited with ${r.status}`);
 }
-async function api(method, p, body) {
-  const r = await fetch(BASE + p, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+async function api(method, p, body, retry = true) {
+  let r;
+  try {
+    r = await fetch(BASE + p, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  } catch (e) {
+    // The agent runs synchronously and can take longer than the server's keep-alive timeout,
+    // so the first request afterwards may land on a socket the server already closed.
+    if (retry) return api(method, p, body, false);
+    throw e;
+  }
   const j = await r.json();
   assert.ok(r.ok, `${method} ${p} -> ${r.status} ${JSON.stringify(j)}`);
   return j;
