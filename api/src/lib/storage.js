@@ -1,4 +1,5 @@
 // Where agent data is kept.
+// - SUPABASE_URL + SUPABASE_SERVICE_KEY set: Supabase over its REST API (tables from db/supabase-setup.sql).
 // - POSTGRES_URL set: PostgreSQL, e.g. a free Supabase project (use its connection pooler URL).
 // - SQL_CONNECTION_STRING set: Azure SQL Database (free offer: 100,000 vCore seconds and 32 GB a month).
 // - COSMOS_CONNECTION_STRING set: Azure Cosmos DB (free tier: 1000 RU/s and 25 GB).
@@ -151,7 +152,40 @@ CREATE INDEX IF NOT EXISTS ix_status_device ON ggt.deployment_status (device_id,
   };
 }
 
+function supabaseStore(url, key) {
+  const base = `${url.replace(/\/+$/, '')}/rest/v1`;
+  const H = { apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
+  const call = async (path, { method = 'GET', body, prefer } = {}) => {
+    const res = await fetch(`${base}/${path}`, { method, headers: prefer ? { ...H, Prefer: prefer } : H, body: body ? JSON.stringify(body) : undefined });
+    if (!res.ok) { const t = await res.text(); throw new Error(`Supabase ${res.status}: ${t.slice(0, 200)}`); }
+    return res;
+  };
+  const json = async (path, opts) => { const r = await call(path, opts); const t = await r.text(); return t ? JSON.parse(t) : null; };
+  const e = encodeURIComponent;
+  const toStatus = r => ({ deviceId: r.device_id, deploymentId: r.deployment_id, state: r.state, errorCode: r.error_code, at: new Date(r.at).toISOString() });
+  return {
+    kind: 'supabase',
+    async getDevice(id) { const r = await json(`ggt_devices?id=eq.${e(id)}&select=doc`); return r[0] ? r[0].doc : null; },
+    async upsertDevice(d) {
+      await call('ggt_devices?on_conflict=id', { method: 'POST', prefer: 'resolution=merge-duplicates,return=minimal', body: { id: d.id, name: d.name, platform: d.platform, last_seen: d.lastSeen, doc: d } });
+      return d;
+    },
+    async listDevices() { return (await json('ggt_devices?select=doc&order=last_seen.desc&limit=1000')).map(r => r.doc); },
+    async countDevices() {
+      const r = await call('ggt_devices?select=id&limit=1', { prefer: 'count=exact' });
+      const n = Number((r.headers.get('content-range') || '').split('/')[1]);
+      return Number.isFinite(n) ? n : 0;
+    },
+    async addStatus(s) { await call('ggt_deployment_status', { method: 'POST', prefer: 'return=minimal', body: { device_id: s.deviceId, deployment_id: s.deploymentId, state: s.state, error_code: s.errorCode, at: s.at } }); },
+    async listStatuses(deviceId) {
+      const f = deviceId ? `device_id=eq.${e(deviceId)}&` : '';
+      return (await json(`ggt_deployment_status?${f}select=*&order=at.desc&limit=500`)).map(toStatus);
+    },
+  };
+}
+
 function createStore(env = process.env) {
+  if (env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY) return supabaseStore(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
   if (env.POSTGRES_URL) return pgStore(env.POSTGRES_URL);
   if (env.SQL_CONNECTION_STRING) return sqlStore(env.SQL_CONNECTION_STRING);
   if (env.COSMOS_CONNECTION_STRING) return cosmosStore(env.COSMOS_CONNECTION_STRING);

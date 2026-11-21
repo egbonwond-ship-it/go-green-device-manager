@@ -53,6 +53,8 @@ To use the real Azure Functions runtime instead: `npm i -g @azure/static-web-app
    az sql db create -s <server> -g go-green-rg -n ggt-devices --edition GeneralPurpose --compute-model Serverless --family Gen5 --capacity 2 --use-free-limit --free-limit-exhaustion-behavior AutoPause
    az staticwebapp appsettings set -n go-green-device-manager --setting-names SQL_CONNECTION_STRING="Server=tcp:<server>.database.windows.net,1433;Database=ggt-devices;User ID=ggtadmin;Password=<password>;Encrypt=true"
    ```
+   **Or Supabase over its REST API (free, no database password):** run `db/supabase-setup.sql` once in Supabase's SQL editor, then set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` (Project Settings → API → service_role key) on the Static Web App. The tables have Row Level Security on with no policies, so the public anon key can't reach them.
+
    **Or PostgreSQL / Supabase (free):** set `POSTGRES_URL` to the project's connection pooler URL (Supabase → Project Settings → Database → Connection string → Transaction pooler). The API creates a private `ggt` schema with `devices` and `deployment_status` tables on first use; it stays out of Supabase's public REST API.
 
    The API creates its `devices` and `deployment_status` tables on first use. The free Azure SQL database pauses when idle, so the first check-in after a quiet spell can take up to a minute. Azure Cosmos DB also works (`COSMOS_CONNECTION_STRING`, free tier). Without either setting, data is kept in memory and lost on restart. `/api/health` shows which storage is in use.
