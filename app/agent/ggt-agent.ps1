@@ -347,6 +347,8 @@ function Invoke-Cycle {
   $swHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes((($sw | ForEach-Object { "$($_.name)|$($_.version)" }) -join "`n")))).Replace('-', '')
   $sendSw = $state.forceInventory -or $swHash -ne $state.softwareHash -or -not $state.softwareAt -or ($now - [int64]$state.softwareAt) -gt 86400000
   $upd = $null
+  # A new device checks in before its first (slow) update scan, so it shows in the console at once.
+  if (-not $script:Config.deviceId) { Invoke-Checkin $inv $sec $sw $null $events $errors | Out-Null; $events = @() }
   if (-not $SkipUpdateScan -and ($state.forceScan -or -not $state.lastScan -or ($now - [int64]$state.lastScan) -gt 6 * 3600000)) {
     try { Write-Log 'Scanning Windows Update'; $upd = Get-UpdateScan; $state.lastScan = $now; $state.forceScan = $false; Write-Log "$(@($upd.missing).Count) updates missing" }
     catch { $errors += "Windows Update scan failed: $($_.Exception.Message)" }

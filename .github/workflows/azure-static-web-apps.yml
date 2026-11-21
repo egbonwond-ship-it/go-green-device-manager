@@ -57,8 +57,8 @@ jobs:
           $t = $null
           for ($i = 0; $i -lt 60 -and -not $t; $i++) { Start-Sleep -Seconds 5; $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent' -ErrorAction SilentlyContinue }
           if (-not $t) { throw 'setup file did not install the agent' }
-          Start-Sleep -Seconds 10
-          $devices = (Invoke-RestMethod http://localhost:4290/api/console/state).devices
+          $devices = @()
+          for ($i = 0; $i -lt 24 -and $devices.Count -lt 1; $i++) { Start-Sleep -Seconds 5; $devices = @((Invoke-RestMethod http://localhost:4290/api/console/state).devices) }
           if ($devices.Count -ne 1) { throw "expected 1 enrolled device, got $($devices.Count)" }
           "Enrolled by setup file: $($devices[0].name)"
           $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent'

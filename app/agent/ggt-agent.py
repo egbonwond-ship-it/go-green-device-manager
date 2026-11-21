@@ -562,6 +562,10 @@ def cycle(skip_scan=False):
     sw_hash = hashlib.sha256('\n'.join('%s|%s' % (s['name'], s['version']) for s in sw).encode()).hexdigest()
     send_sw = state.get('forceInventory') or sw_hash != state.get('softwareHash') or now - state.get('softwareAt', 0) > 86400000
     upd = None
+    # A new device checks in before its first (slow) update scan, so it shows in the console at once.
+    if not CONFIG.get('deviceId'):
+        checkin(inv, sec, sw, None, events, errors)
+        events = []
     if not skip_scan and (state.get('forceScan') or now - state.get('lastScan', 0) > 6 * 3600000):
         try:
             log('Scanning for updates')
