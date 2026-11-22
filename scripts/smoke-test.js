@@ -149,6 +149,27 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal(r.body.doc.rdGateway, 'rdg.example.com');
   console.log('✓ remote desktop: domain, workgroup, Entra, Tailscale, gateway');
 
+  // ---------- VPN: Tailscale key stays private, FortiClient status
+  assert.equal((await call('POST', '/api/console/commands', { type: 'vpnjoin', deviceIds: [id] })).status, 409, 'joining needs a saved key');
+  assert.equal((await call('PUT', '/api/console/vpn/tailscale-key', { authKey: 'not-a-key' })).status, 400, 'key format checked');
+  r = await call('PUT', '/api/console/vpn/tailscale-key', { authKey: 'tskey-auth-kAbc123CNTRL-SecretPart456' });
+  assert.equal(r.status, 200); assert.equal(r.body.set, true);
+  r = await call('GET', '/api/console/state');
+  assert.equal(r.body.tailscaleKey.set, true);
+  assert.ok(!JSON.stringify(r.body).includes('SecretPart456'), 'the key is never sent to the console');
+  r = await call('POST', '/api/console/commands', { type: 'vpnjoin', deviceIds: [id] });
+  assert.equal(r.body.commands[0].status, 'queued');
+  r = await call('GET', '/api/agent/policy', null, KEY2, { deviceId: id });
+  const join = r.body.commands.find(c => c.type === 'vpnjoin');
+  assert.equal(join.authKey, 'tskey-auth-kAbc123CNTRL-SecretPart456', 'the key goes to the device in the join command');
+  r = await call('GET', '/api/console/state');
+  assert.ok(!JSON.stringify(r.body).includes('SecretPart456'), 'the key is not stored on the command');
+  await call('POST', '/api/agent/checkin', { ...report, deviceId: id, fortiConnected: true }, KEY2);
+  assert.equal((await call('GET', '/api/console/state')).body.devices[0].fortiConnected, true, 'FortiClient connection reported');
+  r = await call('PUT', '/api/console/vpn/tailscale-key', { authKey: null });
+  assert.equal(r.body.set, false, 'key removed');
+  console.log('✓ VPN: Tailscale key private, join command, FortiClient status');
+
   // ---------- console rule logic matches the server's
   const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));
   const sample = M.deviceView({ id: 'a', name: 'GGT-ABJ-DT004', platform: 'Windows', os: 'Windows 10 Pro 22H2', build: '19045', type: 'Desktop', tags: ['pilot'], ip: '10.20.1.1', lastSeen: new Date().toISOString() }, { sites: [{ name: 'Abuja', code: 'ABJ', subnets: '10.20.0.0/16' }], apps: [], settings: {} });

@@ -123,7 +123,7 @@ function Get-Inventory {
     memPct = [math]::Round(100 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100))
     agentVersion = $AgentVersion
     joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
-    ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale
+    ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected
   }
 }
 
@@ -150,14 +150,51 @@ function Get-JoinInfo($cs) {
 }
 
 # Tailscale (mesh VPN) address and MagicDNS name, so remote desktop works when the PC is outside the office.
+function Find-Tailscale { @((Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source, "$env:ProgramFiles\Tailscale\tailscale.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1 }
 function Get-Tailscale {
-  $exe = @((Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source, "$env:ProgramFiles\Tailscale\tailscale.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+  $exe = Find-Tailscale
   if (-not $exe) { return $null }
   try {
     $j = (& $exe status --json 2>$null | Out-String) | ConvertFrom-Json
     if (-not $j.Self) { return $null }
     return @{ ips = @($j.Self.TailscaleIPs | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }); dnsName = "$($j.Self.DNSName)".TrimEnd('.'); online = [bool]($j.BackendState -eq 'Running') }
   } catch { return $null }
+}
+
+# FortiClient VPN is connected when its virtual adapter (Fortinet SSL VPN / PPPoP WAN Adapter) is up.
+function Get-FortiConnected {
+  try {
+    $a = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object { $_.InterfaceDescription -match 'Fortinet|FortiClient' })
+    if (-not $a.Count) { return $null }
+    return [bool](@($a | Where-Object { $_.Status -eq 'Up' }).Count)
+  } catch { return $null }
+}
+
+# Joins the company's Tailscale network with the auth key the console sends, installing Tailscale first if needed.
+function Join-Tailscale([string]$AuthKey) {
+  if (-not $AuthKey) { throw 'No Tailscale auth key was sent. Save one on the VPN page.' }
+  $exe = Find-Tailscale
+  if (-not $exe) {
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+    $msi = Join-Path $env:TEMP "tailscale-setup-$arch.msi"
+    try { Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi" -OutFile $msi -UseBasicParsing -TimeoutSec 900 } catch { throw "Couldn't download Tailscale: $($_.Exception.Message). Deploy it from the Software library (winget ID Tailscale.Tailscale), then try again." }
+    $r = Invoke-Process 'msiexec.exe' @('/i', "`"$msi`"", '/qn', '/norestart', 'TS_UNATTENDEDMODE=always') 900
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+    if ($r.exitCode -ne 0 -and $r.exitCode -ne 3010) { throw "Tailscale setup failed with exit code $($r.exitCode)." }
+    for ($i = 0; $i -lt 30 -and -not ($exe = Find-Tailscale); $i++) { Start-Sleep 2 }
+    if (-not $exe) { throw 'Tailscale was installed but tailscale.exe was not found.' }
+  }
+  $r = Invoke-Process $exe @('up', "--authkey=$AuthKey", '--unattended', "--hostname=$($env:COMPUTERNAME.ToLower())") 180
+  if ($r.exitCode -ne 0) { throw "tailscale up failed: $($r.output -replace [regex]::Escape($AuthKey), 'tskey-…')" }
+  $t = Get-Tailscale
+  return "Joined Tailscale as $($t.dnsName) ($(@($t.ips) -join ', '))."
+}
+function Leave-Tailscale {
+  $exe = Find-Tailscale
+  if (-not $exe) { return 'Tailscale is not installed.' }
+  $r = Invoke-Process $exe @('logout') 120
+  if ($r.exitCode -ne 0) { throw "tailscale logout failed: $($r.output)" }
+  return 'Left the Tailscale network. Tailscale is still installed; uninstall it from Deployments if you no longer need it.'
 }
 
 function Get-Security {
@@ -440,6 +477,8 @@ function Invoke-Cycle {
         'updscan' { $state.forceScan = $true; $changed = $true; $res.output = 'Update scan started' }
         'remoteon' { $res.output = Set-RemoteDesktop $true; $changed = $true }
         'remoteoff' { $res.output = Set-RemoteDesktop $false; $changed = $true }
+        'vpnjoin' { $res.output = Join-Tailscale "$($c.authKey)"; $state.forceInventory = $true; $changed = $true }
+        'vpnleave' { $res.output = Leave-Tailscale; $state.forceInventory = $true; $changed = $true }
         default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
       }
     } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }

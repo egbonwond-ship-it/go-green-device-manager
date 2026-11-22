@@ -100,6 +100,7 @@ function sanitizeReport(b) {
     // Remote desktop: how the device signs people in and every address it can be reached on.
     joinType: JOIN_TYPES.includes(b.joinType) ? b.joinType : null, domain: cut(b.domain, 255), netbiosDomain: cut(b.netbiosDomain, 64),
     fqdn: host(b.fqdn), ips: ipList(b.ips), rdpPort: num(b.rdpPort, 1, 65535),
+    fortiConnected: bool(b.fortiConnected),
     tailscale: b.tailscale && typeof b.tailscale === 'object' ? { ips: ipList(b.tailscale.ips), dnsName: host(b.tailscale.dnsName), online: bool(b.tailscale.online) } : null,
     security: {
       encrypted: bool(s.encrypted), avOn: bool(s.avOn), fwOn: bool(s.fwOn), defsAgeDays: num(s.defsAgeDays, 0, 10000),
@@ -177,13 +178,40 @@ async function checkin(b, headers) {
   return { status: 200, body: { deviceId: id, ...(deviceKey ? { deviceKey } : {}), nextCheckInSec: ctx.settings.pollIntervalSec || 300 } };
 }
 
+// ---------- VPN: the Tailscale auth key agents use to join the company tailnet ----------
+// Set TAILSCALE_AUTH_KEY in Azure, or save one from the VPN page. The console can replace or remove
+// the key but never read it back.
+async function tailscaleKey() {
+  if (process.env.TAILSCALE_AUTH_KEY) return process.env.TAILSCALE_AUTH_KEY;
+  return (await db.getObject('secret', 'tailscale'))?.authKey || null;
+}
+async function vpnKeyInfo() {
+  if (process.env.TAILSCALE_AUTH_KEY) return { set: true, source: 'env' };
+  const k = await db.getObject('secret', 'tailscale');
+  return k?.authKey ? { set: true, source: 'console', setAt: k.setAt, by: k.by } : { set: false };
+}
+async function saveTailscaleKey(b, user) {
+  if (process.env.TAILSCALE_AUTH_KEY) return { status: 409, body: { error: 'The key is set by TAILSCALE_AUTH_KEY in Azure. Change it there.' } };
+  if (b.authKey === null || b.authKey === '') {
+    await db.deleteObject('secret', 'tailscale');
+    await log('VPN', 'Removed the Tailscale auth key', 'info', user);
+    return { status: 200, body: await vpnKeyInfo() };
+  }
+  if (!/^tskey-[A-Za-z0-9-]{10,200}$/.test(String(b.authKey || '').trim())) return { status: 400, body: { error: 'That doesn’t look like a Tailscale auth key (it starts with tskey-).' } };
+  await db.putObject('secret', 'tailscale', { id: 'tailscale', authKey: String(b.authKey).trim(), setAt: Date.now(), by: user });
+  await log('VPN', 'Saved a new Tailscale auth key', 'info', user);
+  return { status: 200, body: await vpnKeyInfo() };
+}
+
 async function policy(query, headers) {
   const a = await deviceAuth(headers, query.deviceId);
   if (a.error) return a.error;
   const ctx = await loadCtx();
   const queued = await db.listObjects('command', { where: { deviceId: a.doc.id, status: 'queued' }, limit: 20 });
   if (queued.length) await db.putMany('command', queued.map(c => ({ ...c, status: 'sent', sentAt: Date.now() })));
-  return { status: 200, body: M.buildPolicy(a.doc, ctx, queued) };
+  // The Tailscale auth key travels only inside a join command to the device it's for; it's never stored on the command.
+  const key = queued.some(c => c.type === 'vpnjoin') ? await tailscaleKey() : null;
+  return { status: 200, body: M.buildPolicy(a.doc, ctx, queued.map(c => (c.type === 'vpnjoin' ? { ...c, authKey: key } : c))) };
 }
 
 async function status(b, headers) {
@@ -229,6 +257,7 @@ async function consoleState(user, headers) {
     body: {
       now: Date.now(), version: VERSION, storage: db.kind, user, viewerIp: clientIp(headers),
       enrollmentConfigured: Boolean(process.env.AGENT_ENROLL_TOKEN),
+      tailscaleKey: await vpnKeyInfo(),
       devices: docs.map(d => M.deviceView(d, ctx)), updates: M.updateCatalogue(docs),
       ...ctx, scripts, alerts, log: logs, commands, scriptRuns,
     },
@@ -276,12 +305,13 @@ async function deleteObject(kind, id, query, user) {
 }
 
 const PLATFORMS_FOR = { PowerShell: ['Windows'], Shell: ['macOS', 'Linux'] };
-const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop' };
+const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop', vpnjoin: 'Join Tailscale', vpnleave: 'Leave Tailscale' };
 const REMOTE_PLATFORMS = ['Windows', 'macOS'];
 async function createCommands(b, user) {
   const ids = arr(b.deviceIds, 2000) || [];
   if (!ids.length) return { status: 400, body: { error: 'deviceIds is required' } };
-  if (!['script', 'restart', 'inventory', 'updscan', 'remoteon', 'remoteoff'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory, updscan, remoteon or remoteoff' } };
+  if (!['script', 'restart', 'inventory', 'updscan', 'remoteon', 'remoteoff', 'vpnjoin', 'vpnleave'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory, updscan, remoteon, remoteoff, vpnjoin or vpnleave' } };
+  if (b.type === 'vpnjoin' && !(await tailscaleKey())) return { status: 409, body: { error: 'Save a Tailscale auth key on the VPN page first' } };
   let script = null;
   if (b.type === 'script') { script = str(b.scriptId, 64) ? await db.getObject('script', b.scriptId) : null; if (!script) return { status: 404, body: { error: 'Unknown script' } }; }
   const devices = new Map((await db.listDevices()).map(d => [d.id, d]));
@@ -299,7 +329,7 @@ async function createCommands(b, user) {
   });
   await db.putMany('command', cmds);
   await db.putObject('scriptRun', runId, { id: runId, t: now, type: b.type, script: script ? script.name : COMMAND_NAMES[b.type], count: cmds.length, by: user });
-  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
+  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : b.type.startsWith('vpn') ? 'VPN' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
   return { status: 200, body: { runId, commands: cmds.map(({ body, ...c }) => c) } };
 }
 
@@ -331,6 +361,7 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
     if (route === 'GET /api/console/state') return consoleState(user, headers);
     if (route === 'GET /api/console/enrollment') return { status: 200, body: { token: process.env.AGENT_ENROLL_TOKEN || null } };
     if (route === 'POST /api/console/commands') return createCommands(body || {}, user);
+    if (route === 'PUT /api/console/vpn/tailscale-key') return saveTailscaleKey(body || {}, user);
     if (route === 'POST /api/console/alerts/ack') {
       const all = await db.listObjects('alert', { where: { ack: false }, limit: 1000 });
       const pick = body?.all ? all : all.filter(a => (body?.ids || []).includes(a.id));
