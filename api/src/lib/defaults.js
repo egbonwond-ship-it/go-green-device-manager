@@ -1,7 +1,7 @@
 // Built-in configuration written to the database the first time the console opens.
 // Admins can change all of it afterwards except the built-in collections.
 module.exports = {
-  settings: { id: 'main', approvedAdmins: ['Administrator', 'Domain Admins', 'root'], pollIntervalSec: 300, lowDiskPct: 10 },
+  settings: { id: 'main', approvedAdmins: ['Administrator', 'Domain Admins', 'root'], pollIntervalSec: 300, lowDiskPct: 10, rdGateway: '' },
   collections: [
     { id: 'c-all', name: 'All Systems', description: 'Every managed device.', builtIn: true, match: 'all', rules: [] },
     { id: 'c-wks', name: 'All Windows Workstations', description: 'Windows laptops and desktops.', builtIn: true, match: 'all', rules: [{ field: 'platform', op: 'is', value: 'Windows' }, { field: 'type', op: 'in', value: 'Laptop,Desktop' }] },

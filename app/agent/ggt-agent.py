@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.1.0'
+AGENT_VERSION = '2.2.0'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -167,6 +167,53 @@ def primary_ip():
         s.close()
 
 
+def all_ips():
+    """Every IPv4 address (LAN, Wi-Fi, VPN, Tailscale), the primary one first."""
+    if IS_MAC:
+        found = re.findall(r'\binet (\d+\.\d+\.\d+\.\d+)', out(['ifconfig']))
+    else:
+        found = re.findall(r'\binet (\d+\.\d+\.\d+\.\d+)', out(['ip', '-4', '-o', 'addr', 'show']))
+    first = primary_ip()
+    ips = [first] if first else []
+    for a in found:
+        if a not in ips and not a.startswith(('127.', '169.254.')):
+            ips.append(a)
+    return ips[:16]
+
+
+def join_info():
+    """Active Directory binding (macOS dsconfigad, Linux realmd/sssd) and the name the device is reachable by."""
+    short = socket.gethostname().split('.')[0]
+    domain = ''
+    if IS_MAC:
+        m = re.search(r'Active Directory Domain\s*=\s*(\S+)', out(['dsconfigad', '-show']))
+        domain = m.group(1) if m else ''
+        local = out(['scutil', '--get', 'LocalHostName'])
+        fqdn = '%s.%s' % (short, domain) if domain else ('%s.local' % local if local else None)
+    else:
+        m = re.search(r'^\s*domain-name:\s*(\S+)', out(['realm', 'list']), re.M) if shutil.which('realm') else None
+        domain = m.group(1) if m else ''
+        f = socket.getfqdn()
+        fqdn = '%s.%s' % (short, domain) if domain else (f if '.' in f and not f.startswith('localhost') else None)
+    return {'joinType': 'Domain' if domain else 'Workgroup', 'domain': domain or None, 'fqdn': fqdn.lower() if fqdn else None}
+
+
+def tailscale():
+    """Tailscale (mesh VPN) address and MagicDNS name, so remote access works outside the office."""
+    exe = shutil.which('tailscale') or next((p for p in ('/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale') if os.path.exists(p)), None)
+    if not exe:
+        return None
+    try:
+        j = json.loads(out([exe, 'status', '--json'], timeout=20) or '{}')
+    except ValueError:
+        return None
+    me = j.get('Self') or {}
+    if not me:
+        return None
+    return {'ips': [a for a in me.get('TailscaleIPs') or [] if re.match(r'^\d+\.\d+\.\d+\.\d+$', a)],
+            'dnsName': (me.get('DNSName') or '').rstrip('.') or None, 'online': j.get('BackendState') == 'Running'}
+
+
 def mac_address():
     if IS_MAC:
         iface = ''
@@ -283,6 +330,7 @@ def inventory():
         'ramGB': ram, 'diskGB': round(size / 1e9), 'diskFreePct': round(free / size * 100) if size else None,
         'ip': primary_ip(), 'mac': mac_address(), 'user': console_user(), 'lastBoot': iso(boot) if boot else None,
         'cpuPct': cpu_percent(), 'memPct': mem_pct, 'agentVersion': AGENT_VERSION,
+        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), **join_info(),
     }
 
 
