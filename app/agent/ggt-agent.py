@@ -198,9 +198,54 @@ def join_info():
     return {'joinType': 'Domain' if domain else 'Workgroup', 'domain': domain or None, 'fqdn': fqdn.lower() if fqdn else None}
 
 
+def find_tailscale():
+    return shutil.which('tailscale') or next((p for p in ('/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale', '/usr/bin/tailscale') if os.path.exists(p)), None)
+
+
+def forti_connected():
+    """FortiClient VPN is connected when its tunnel (ppp on macOS, ppp/fctvpn on Linux) has an address. None when FortiClient isn't installed."""
+    installed = os.path.exists('/Applications/FortiClient.app') if IS_MAC else (os.path.exists('/opt/forticlient') or bool(shutil.which('openfortivpn')))
+    if not installed:
+        return None
+    if IS_MAC:
+        blocks = re.split(r'\n(?=\S)', out(['ifconfig']))
+        return any(b.startswith('ppp') and '\tinet ' in b or b.startswith('ppp') and ' inet ' in b for b in blocks)
+    return bool(re.search(r'\d+: (ppp\d+|fctvpn\w*|vpn\d+)\s+inet ', out(['ip', '-4', '-o', 'addr', 'show'])))
+
+
+def join_tailscale(key):
+    """Join the company's Tailscale network with the auth key the console sent, installing Tailscale on Linux if needed."""
+    if not key:
+        raise RuntimeError('No Tailscale auth key was sent. Save one on the VPN page.')
+    exe = find_tailscale()
+    if not exe and not IS_MAC:
+        code, text = sh(['/bin/sh', '-c', 'curl -fsSL https://tailscale.com/install.sh | sh'], timeout=900)
+        if code != 0:
+            raise RuntimeError('Tailscale install failed: %s' % text[-500:])
+        sh(['systemctl', 'enable', '--now', 'tailscaled'])
+        exe = find_tailscale()
+    if not exe:
+        raise RuntimeError('Tailscale is not installed. Install the standalone Tailscale app for macOS (from pkgs.tailscale.com or the Software library), then try again.')
+    code, text = sh([exe, 'up', '--authkey=' + key, '--hostname=' + socket.gethostname().split('.')[0].lower()], timeout=180)
+    if code != 0:
+        raise RuntimeError('tailscale up failed: %s' % text.replace(key, 'tskey-…')[-500:])
+    t = tailscale() or {}
+    return 'Joined Tailscale as %s (%s).' % (t.get('dnsName') or '?', ', '.join(t.get('ips') or []))
+
+
+def leave_tailscale():
+    exe = find_tailscale()
+    if not exe:
+        return 'Tailscale is not installed.'
+    code, text = sh([exe, 'logout'], timeout=120)
+    if code != 0:
+        raise RuntimeError('tailscale logout failed: %s' % text[-500:])
+    return 'Left the Tailscale network. Tailscale is still installed.'
+
+
 def tailscale():
     """Tailscale (mesh VPN) address and MagicDNS name, so remote access works outside the office."""
-    exe = shutil.which('tailscale') or next((p for p in ('/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale') if os.path.exists(p)), None)
+    exe = find_tailscale()
     if not exe:
         return None
     try:
@@ -330,7 +375,7 @@ def inventory():
         'ramGB': ram, 'diskGB': round(size / 1e9), 'diskFreePct': round(free / size * 100) if size else None,
         'ip': primary_ip(), 'mac': mac_address(), 'user': console_user(), 'lastBoot': iso(boot) if boot else None,
         'cpuPct': cpu_percent(), 'memPct': mem_pct, 'agentVersion': AGENT_VERSION,
-        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), **join_info(),
+        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), 'fortiConnected': forti_connected(), **join_info(),
     }
 
 
@@ -678,6 +723,12 @@ def cycle(skip_scan=False):
             try:
                 res['output'] = set_screen_sharing(t == 'remoteon')
                 changed = True
+            except Exception as e:  # noqa: BLE001 - reported to the console
+                res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
+        elif t in ('vpnjoin', 'vpnleave'):
+            try:
+                res['output'] = join_tailscale(c.get('authKey')) if t == 'vpnjoin' else leave_tailscale()
+                state['forceInventory'] = changed = True
             except Exception as e:  # noqa: BLE001 - reported to the console
                 res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
         else:

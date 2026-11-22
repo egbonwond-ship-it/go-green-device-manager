@@ -29,6 +29,7 @@ Everything the console shows comes from agents on real devices. There is no demo
 | Software library | Applications with how to install them per platform (winget ID, MSI/EXE/PKG/DMG/DEB/RPM URL with SHA-256, package name, or a command) and how to detect them. |
 | Deployments | Install or uninstall an application, or install an update group, on a collection: install time, maintenance windows, restart behaviour. Live per-device results and error codes; retry failed. |
 | Remote desktop | Turn Remote Desktop (Windows) or Screen Sharing (macOS) on or off through the agent, see which devices accept connections, and connect: a `.rdp` file for Windows PCs, `vnc://` for Macs. Works for PCs in the domain (connects by domain name, DOMAIN\\name), workgroup PCs (PC-NAME\\name) and Microsoft Entra joined PCs (Entra sign-in). On the office network or VPN it connects directly; devices on another network are reached over Tailscale, or an optional Remote Desktop Gateway set under Administration. |
+| VPN | FortiClient (office VPN) installed and connected on each device, and Tailscale status with its address. Join devices to the company's Tailscale network with one click: the agent installs Tailscale if needed and signs in with an auth key saved on the page (or the `TAILSCALE_AUTH_KEY` setting), which is sent only to the device being joined. |
 | Software updates | Every update agents report (Windows Update, macOS softwareupdate, apt, dnf/yum) with required and installed counts. Update groups, and automatic deployment rules that approve matching updates for a collection as devices find them. |
 | Compliance | Three baselines (Endpoint Security, OS Currency & Patching, Corporate Configuration). Per-rule results, compliance by site, non-compliant devices. Optional automatic remediation by the agent. |
 | Monitoring & alerts | Online/offline/inactive, alerts (firewall or antivirus turned off, new local admin, low disk, failed deployment) with acknowledge, health map by site, CPU and disk, activity log. |
@@ -47,6 +48,7 @@ Static Web Apps' built-in sign-in protects the whole console (Microsoft or GitHu
 | `ADMIN_USERS` | Who may use the console, e.g. `egbonwond-ship-it, it@go-greentechnologies.com`. |
 | `AGENT_ENROLL_TOKEN` | Long random secret agents must present. Shown to admins in **Devices → Enrol devices**. |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | Supabase project URL and service-role key. Run `db/supabase-setup.sql` once in the SQL editor first. |
+| `TAILSCALE_AUTH_KEY` | Optional. A reusable, pre-approved Tailscale auth key for joining devices from the VPN page. Instead, admins can save one on the VPN page. |
 | `POSTGRES_URL` | Alternative to Supabase: any PostgreSQL connection string (tables are created in a `ggt` schema). |
 
 Without a database setting the API keeps data in memory, which is lost on restart (fine for local runs only). `/api/health` reports which storage is in use.

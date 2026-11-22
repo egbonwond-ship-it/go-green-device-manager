@@ -296,6 +296,12 @@ export async function runScript(scriptId, deviceIds) {
 export function deviceAction(id, action) {
   return send('POST', '/api/console/commands', { type: action, deviceIds: [id] }).then(r => { refresh(); return r; });
 }
+export function devicesAction(ids, action) {
+  return send('POST', '/api/console/commands', { type: action, deviceIds: ids }).then(r => { refresh(); return r; });
+}
+export function saveTailscaleKey(authKey) {
+  return send('PUT', '/api/console/vpn/tailscale-key', { authKey }).then(r => { state.tailscaleKey = r; emit(); refresh(); return r; });
+}
 export const runCommands = runId => state.commands.filter(c => c.runId === runId);
 export function saveScript(s) {
   const isNew = !s.id;
