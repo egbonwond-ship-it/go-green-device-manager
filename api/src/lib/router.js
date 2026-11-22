@@ -83,7 +83,7 @@ function sanitizeReport(b) {
     security: {
       encrypted: bool(s.encrypted), avOn: bool(s.avOn), fwOn: bool(s.fwOn), defsAgeDays: num(s.defsAgeDays, 0, 10000),
       screenLockMin: num(s.screenLockMin, 0, 100000), usbBlocked: bool(s.usbBlocked), pendingReboot: bool(s.pendingReboot),
-      localAdmins: arr(s.localAdmins, 100)?.map(a => cut(a, 120)) ?? null,
+      localAdmins: arr(s.localAdmins, 100)?.map(a => cut(a, 120)) ?? null, remoteOn: bool(s.remoteOn),
     },
   };
 }
@@ -249,11 +249,12 @@ async function deleteObject(kind, id, query, user) {
 }
 
 const PLATFORMS_FOR = { PowerShell: ['Windows'], Shell: ['macOS', 'Linux'] };
-const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates' };
+const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop' };
+const REMOTE_PLATFORMS = ['Windows', 'macOS'];
 async function createCommands(b, user) {
   const ids = arr(b.deviceIds, 2000) || [];
   if (!ids.length) return { status: 400, body: { error: 'deviceIds is required' } };
-  if (!['script', 'restart', 'inventory', 'updscan'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory or updscan' } };
+  if (!['script', 'restart', 'inventory', 'updscan', 'remoteon', 'remoteoff'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory, updscan, remoteon or remoteoff' } };
   let script = null;
   if (b.type === 'script') { script = str(b.scriptId, 64) ? await db.getObject('script', b.scriptId) : null; if (!script) return { status: 404, body: { error: 'Unknown script' } }; }
   const devices = new Map((await db.listDevices()).map(d => [d.id, d]));
@@ -266,11 +267,12 @@ async function createCommands(b, user) {
       if (!(PLATFORMS_FOR[script.lang] || []).includes(d.platform)) return { ...c, status: 'skipped', output: `${script.lang} scripts don't run on ${d.platform}.` };
       return { ...c, lang: script.lang, body: script.body };
     }
+    if (b.type.startsWith('remote') && !REMOTE_PLATFORMS.includes(d.platform)) return { ...c, status: 'skipped', output: `Remote desktop is managed on Windows and macOS only, not ${d.platform}.` };
     return c;
   });
   await db.putMany('command', cmds);
   await db.putObject('scriptRun', runId, { id: runId, t: now, type: b.type, script: script ? script.name : COMMAND_NAMES[b.type], count: cmds.length, by: user });
-  await log(script ? 'Scripts' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
+  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
   return { status: 200, body: { runId, commands: cmds.map(({ body, ...c }) => c) } };
 }
 

@@ -113,7 +113,12 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.ok(r.body.alerts.some(a => /Deployment failed/.test(a.title)));
   r = await call('POST', '/api/console/alerts/ack', { all: true });
   assert.ok(r.body.acknowledged >= 3);
-  console.log('✓ commands: platform check, single delivery, results, deployment status, alerts');
+  r = await call('POST', '/api/console/commands', { type: 'remoteon', deviceIds: [id] });
+  assert.equal(r.body.commands[0].status, 'queued', 'remote desktop command queued for Windows');
+  r = await call('GET', '/api/agent/policy', null, KEY2, { deviceId: id });
+  assert.equal(r.body.commands[0].type, 'remoteon');
+  assert.equal((await call('POST', '/api/console/commands', { type: 'reboot-now', deviceIds: [id] })).status, 400, 'unknown command type rejected');
+  console.log('✓ commands: platform check, single delivery, results, deployment status, alerts, remote desktop');
 
   // ---------- console rule logic matches the server's
   const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));

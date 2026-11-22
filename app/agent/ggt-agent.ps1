@@ -29,7 +29,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.0.1'
+$AgentVersion = '2.1.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -120,7 +120,7 @@ function Get-Inventory {
 }
 
 function Get-Security {
-  $s = [ordered]@{ encrypted = $null; avOn = $null; fwOn = $null; defsAgeDays = $null; screenLockMin = $null; usbBlocked = $null; pendingReboot = $false; localAdmins = $null }
+  $s = [ordered]@{ encrypted = $null; avOn = $null; fwOn = $null; defsAgeDays = $null; screenLockMin = $null; usbBlocked = $null; pendingReboot = $false; localAdmins = $null; remoteOn = $null }
   try {
     $v = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction Stop
     $s.encrypted = [bool]($v -and [int]$v.ProtectionStatus -eq 1)
@@ -148,7 +148,29 @@ function Get-Security {
       $s.localAdmins = @($g.psbase.Invoke('Members') | ForEach-Object { $_.GetType().InvokeMember('Name', 'GetProperty', $null, $_, $null) })
     } catch { }
   }
+  $s.remoteOn = Get-RemoteOn
   return $s
+}
+
+# ---------------------------------------------------------------- remote desktop
+$TsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+function Get-RemoteOn {
+  try { return ((Get-ItemProperty $TsKey -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections -eq 0) } catch { return $null }
+}
+function Set-RemoteDesktop([bool]$On) {
+  $os = Get-CimInstance Win32_OperatingSystem
+  if ($On -and $os.ProductType -eq 1 -and $os.Caption -match 'Home') { throw "$(($os.Caption -replace '^Microsoft\s+', '').Trim()) can't accept Remote Desktop connections. It needs Windows Pro, Enterprise or Server." }
+  Set-ItemProperty $TsKey -Name fDenyTSConnections -Value ([int](-not $On)) -Type DWord
+  if ($On) { Set-ItemProperty "$TsKey\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1 -Type DWord }
+  $enable = if ($On) { 'yes' } else { 'no' }
+  try {
+    if ($On) { Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction Stop } else { Disable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction Stop }
+  } catch { & netsh.exe advfirewall firewall set rule group="remote desktop" new enable=$enable | Out-Null }
+  if ($On) { Set-Service TermService -StartupType Manual -ErrorAction SilentlyContinue; Start-Service TermService -ErrorAction SilentlyContinue }
+  if ((Get-RemoteOn) -ne $On) { throw 'Windows did not accept the change. A Group Policy may control Remote Desktop on this PC.' }
+  if (-not $On) { return 'Remote Desktop is off.' }
+  $port = (Get-ItemProperty "$TsKey\WinStations\RDP-Tcp" -Name PortNumber -ErrorAction SilentlyContinue).PortNumber
+  return "Remote Desktop is on (port $port, Network Level Authentication required). Sign in with a Windows account that is an administrator or in the Remote Desktop Users group."
 }
 
 function Get-Software {
@@ -375,6 +397,8 @@ function Invoke-Cycle {
         'restart' { Request-Restart; $res.output = 'Restart scheduled in 5 minutes' }
         'inventory' { $state.forceInventory = $true; $changed = $true; $res.output = 'Inventory sent' }
         'updscan' { $state.forceScan = $true; $changed = $true; $res.output = 'Update scan started' }
+        'remoteon' { $res.output = Set-RemoteDesktop $true; $changed = $true }
+        'remoteoff' { $res.output = Set-RemoteDesktop $false; $changed = $true }
         default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
       }
     } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }
