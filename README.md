@@ -28,6 +28,7 @@ Everything the console shows comes from agents on real devices. There is no demo
 | Collections | Rule-based device groups (platform, OS, type, site, tag, health, manufacturer, name, user, installed app). |
 | Software library | Applications with how to install them per platform (winget ID, MSI/EXE/PKG/DMG/DEB/RPM URL with SHA-256, package name, or a command) and how to detect them. |
 | Deployments | Install or uninstall an application, or install an update group, on a collection: install time, maintenance windows, restart behaviour. Live per-device results and error codes; retry failed. |
+| Remote desktop | Turn Remote Desktop (Windows) or Screen Sharing (macOS) on or off through the agent, see which devices accept connections, and connect: a `.rdp` file for Windows PCs, `vnc://` for Macs. Works on the office network or VPN. |
 | Software updates | Every update agents report (Windows Update, macOS softwareupdate, apt, dnf/yum) with required and installed counts. Update groups, and automatic deployment rules that approve matching updates for a collection as devices find them. |
 | Compliance | Three baselines (Endpoint Security, OS Currency & Patching, Corporate Configuration). Per-rule results, compliance by site, non-compliant devices. Optional automatic remediation by the agent. |
 | Monitoring & alerts | Online/offline/inactive, alerts (firewall or antivirus turned off, new local admin, low disk, failed deployment) with acknowledge, health map by site, CPU and disk, activity log. |
@@ -72,6 +73,7 @@ What the agent reports and does:
 - **Inventory:** name, OS and build, type (laptop, desktop, server, VM), manufacturer, model, serial, CPU, memory, disk, IP and MAC, signed-in user, last boot, CPU and memory use, and installed programs (sent when they change, at least daily).
 - **Security:** disk encryption (BitLocker, FileVault, LUKS), antivirus real-time protection and definition age (Microsoft Defender or Windows Security Center), firewall, screen-lock timeout, local administrators, USB storage block, pending restart.
 - **Updates:** scans every 6 hours, or when asked, and installs approved updates.
+- **Remote desktop:** turns Remote Desktop (with Network Level Authentication and its firewall rules) or macOS Screen Sharing on or off when asked, and reports whether it's on. Newer macOS versions may only allow Screen Sharing to be turned on in System Settings.
 - **Remediation** (only for baselines where you turn it on): firewall, Defender real-time protection and definitions, screen lock, USB storage block on Windows; firewall on macOS.
 
 ## Run locally
@@ -111,7 +113,7 @@ app/                       Console (deployed as-is)
   js/store.js              Console state from the API, collection and compliance rules
   js/ui.js                 Tables, modals, drawers, charts
   js/agent-setup.js        Downloadable agent setup files (Windows .cmd, macOS/Linux .sh)
-  js/views/*.js            One file per page
+  js/views/*.js            One file per page (remote.js: Remote desktop)
   agent/ggt-agent.ps1      Windows agent
   agent/ggt-agent.py       macOS and Linux agent
 api/src/lib/router.js      API routes, sign-in check, agent auth

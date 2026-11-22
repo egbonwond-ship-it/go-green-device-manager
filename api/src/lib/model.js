@@ -61,7 +61,7 @@ function deviceView(doc, ctx, now = Date.now()) {
     agentErrors: doc.agentErrors || [],
     tags: doc.tags || [], site: site ? site.name : 'Unassigned', siteCode: site ? site.code : '',
     encrypted: sec.encrypted ?? null, avOn: sec.avOn ?? null, fwOn: sec.fwOn ?? null, defsAgeDays: sec.defsAgeDays ?? null,
-    screenLockMin: sec.screenLockMin ?? null, usbBlocked: sec.usbBlocked ?? null,
+    screenLockMin: sec.screenLockMin ?? null, usbBlocked: sec.usbBlocked ?? null, remoteOn: sec.remoteOn ?? null,
     localAdmins: sec.localAdmins || null, extraAdmins: extras === null ? null : extras.length > 0, unapprovedAdmins: extras || [],
     pendingRebootSince: ms(doc.pendingRebootSince),
     softwareCount: software.length, softwareAt: ms(doc.softwareAt),

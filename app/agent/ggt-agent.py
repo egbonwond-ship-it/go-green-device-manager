@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.0.1'
+AGENT_VERSION = '2.1.0'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -308,12 +308,13 @@ def group_members(*names):
 
 
 def security():
-    s = {'encrypted': None, 'avOn': None, 'fwOn': None, 'defsAgeDays': None, 'screenLockMin': None, 'usbBlocked': None, 'pendingReboot': False, 'localAdmins': None}
+    s = {'encrypted': None, 'avOn': None, 'fwOn': None, 'defsAgeDays': None, 'screenLockMin': None, 'usbBlocked': None, 'pendingReboot': False, 'localAdmins': None, 'remoteOn': None}
     if IS_MAC:
         s['encrypted'] = 'FileVault is On' in out(['fdesetup', 'status'])
         s['fwOn'] = 'enabled' in out(['/usr/libexec/ApplicationFirewall/socketfilterfw', '--getglobalstate']).lower()
         m = out(['dscl', '.', '-read', '/Groups/admin', 'GroupMembership'])
         s['localAdmins'] = m.split(':', 1)[1].split() if ':' in m else None
+        s['remoteOn'] = mac_screen_sharing_on()
         return s
     lsblk = out(['lsblk', '-rno', 'TYPE'])
     s['encrypted'] = 'crypt' in lsblk.split() if lsblk else None
@@ -334,6 +335,30 @@ def security():
     s['pendingReboot'] = os.path.exists('/var/run/reboot-required')
     s['localAdmins'] = ['root'] + [m for m in group_members('sudo', 'wheel', 'admin') if m != 'root']
     return s
+
+
+SCREEN_SHARING = 'system/com.apple.screensharing'
+
+
+def mac_screen_sharing_on():
+    """Screen Sharing is on when launchd has its service loaded (it then listens on port 5900)."""
+    return sh(['launchctl', 'print', SCREEN_SHARING], timeout=20)[0] == 0
+
+
+def set_screen_sharing(on):
+    if not IS_MAC:
+        raise RuntimeError('Remote desktop is managed on Windows and macOS only')
+    if on:
+        sh(['launchctl', 'enable', SCREEN_SHARING])
+        sh(['launchctl', 'bootstrap', 'system', '/System/Library/LaunchDaemons/com.apple.screensharing.plist'])
+    else:
+        sh(['launchctl', 'bootout', SCREEN_SHARING])
+        sh(['launchctl', 'disable', SCREEN_SHARING])
+    if mac_screen_sharing_on() != on:
+        raise RuntimeError('macOS did not allow the change. Turn Screen Sharing %s in System Settings > General > Sharing on this Mac.' % ('on' if on else 'off'))
+    if not on:
+        return 'Screen Sharing is off.'
+    return 'Screen Sharing is on (port 5900). Sign in with a user account on this Mac that is allowed in System Settings > General > Sharing > Screen Sharing.'
 
 
 def software():
@@ -601,6 +626,12 @@ def cycle(skip_scan=False):
         elif t == 'updscan':
             state['forceScan'] = changed = True
             res['output'] = 'Update scan started'
+        elif t in ('remoteon', 'remoteoff'):
+            try:
+                res['output'] = set_screen_sharing(t == 'remoteon')
+                changed = True
+            except Exception as e:  # noqa: BLE001 - reported to the console
+                res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
         else:
             res = {'status': 'failed', 'exitCode': None, 'output': 'Unknown command %s' % t}
         try:

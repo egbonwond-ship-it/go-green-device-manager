@@ -100,6 +100,23 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
     assert.equal(d2.depState['dep-e2e']?.state, 'success', 'test app installed');
     assert.ok(d2.installed.includes('app-e2e'), 'test app detected in inventory');
 
+    // Remote desktop: Windows must turn Remote Desktop on and off; macOS may refuse without MDM, so log it.
+    for (const type of ['remoteon', 'remoteoff']) {
+      const rr = await api('POST', '/api/console/commands', { type, deviceIds: [dev.id] });
+      if (!WIN && !MAC) { assert.equal(rr.commands[0].status, 'skipped', 'remote desktop is not managed on Linux'); break; }
+      agent(WIN ? '-Run' : 'run');
+      st = await api('GET', '/api/console/state');
+      const rc = st.commands.find(c => c.runId === rr.runId);
+      console.log(`Remote desktop ${type}:`, rc.status, rc.output, 'reported remoteOn =', st.devices[0].remoteOn);
+      if (WIN) {
+        assert.equal(rc.status, 'succeeded', `${type} succeeded`);
+        assert.equal(st.devices[0].remoteOn, type === 'remoteon', 'remote desktop state reported');
+      } else {
+        assert.ok(['succeeded', 'failed'].includes(rc.status) && rc.output, 'Screen Sharing result reported');
+        if (rc.status === 'succeeded') assert.equal(st.devices[0].remoteOn, type === 'remoteon');
+      }
+    }
+
     // Uninstall through a deployment, too.
     await api('PUT', '/api/console/objects/deployment/dep-e2e', { doc: { id: 'dep-e2e', name: 'E2E install', kind: 'app', targetId: 'app-e2e', collectionId: 'c-all', action: 'Uninstall', enabled: true, respectMW: true, restart: 'Suppress', retryAt: Date.now() } });
     agent(WIN ? '-Run' : 'run');
