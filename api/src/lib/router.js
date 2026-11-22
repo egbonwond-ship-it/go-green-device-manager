@@ -5,6 +5,7 @@
 //   /api/agent/*         the Go-Green agent on each device (enrollment token + per-device key)
 //   /api/console/*       the web console (signed-in users listed in ADMIN_USERS)
 const crypto = require('crypto');
+const net = require('net');
 const { createStore } = require('./storage');
 const M = require('./model');
 const DEFAULTS = require('./defaults');
@@ -24,6 +25,22 @@ const newId = p => `${p}-${Date.now().toString(36)}${crypto.randomBytes(4).toStr
 const sha = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const ID_RE = /^[\w.-]{1,64}$/;
 const SEVERITIES = ['Critical', 'Important', 'Moderate', 'Low'];
+
+// The caller's public address as Azure (or a proxy) saw it. Used to tell whether a device and the
+// admin's browser are on the same network, so remote desktop can pick the right address.
+function clientIp(headers = {}) {
+  for (const h of ['x-azure-clientip', 'x-client-ip', 'x-forwarded-for']) {
+    let v = String(headers[h] || '').split(',')[0].trim();
+    if (!v) continue;
+    const m4 = v.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/); if (m4) v = m4[1];
+    const m6 = v.match(/^\[([^\]]+)\](?::\d+)?$/); if (m6) v = m6[1];
+    if (net.isIP(v)) return v;
+  }
+  return null;
+}
+const ipList = v => (arr(v, 16) || []).filter(a => typeof a === 'string' && net.isIP(a)).map(a => a.slice(0, 45));
+const host = v => (typeof v === 'string' && /^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$/.test(v.replace(/\.$/, '')) ? v.replace(/\.$/, '').toLowerCase() : null);
+const JOIN_TYPES = ['Domain', 'Hybrid', 'Entra', 'Workgroup'];
 
 function safeEqual(a, b) {
   const x = Buffer.from(String(a || '')), y = Buffer.from(String(b || ''));
@@ -80,6 +97,10 @@ function sanitizeReport(b) {
     ramGB: num(b.ramGB, 0, 100000), diskGB: num(b.diskGB, 0, 1e7), diskFreePct: num(b.diskFreePct, 0, 100),
     ip: cut(b.ip, 45), mac: cut(b.mac, 40), user: cut(b.user, 100), lastBoot: date(b.lastBoot),
     cpuPct: num(b.cpuPct, 0, 100), memPct: num(b.memPct, 0, 100), agentVersion: cut(b.agentVersion, 20),
+    // Remote desktop: how the device signs people in and every address it can be reached on.
+    joinType: JOIN_TYPES.includes(b.joinType) ? b.joinType : null, domain: cut(b.domain, 255), netbiosDomain: cut(b.netbiosDomain, 64),
+    fqdn: host(b.fqdn), ips: ipList(b.ips), rdpPort: num(b.rdpPort, 1, 65535),
+    tailscale: b.tailscale && typeof b.tailscale === 'object' ? { ips: ipList(b.tailscale.ips), dnsName: host(b.tailscale.dnsName), online: bool(b.tailscale.online) } : null,
     security: {
       encrypted: bool(s.encrypted), avOn: bool(s.avOn), fwOn: bool(s.fwOn), defsAgeDays: num(s.defsAgeDays, 0, 10000),
       screenLockMin: num(s.screenLockMin, 0, 100000), usbBlocked: bool(s.usbBlocked), pendingReboot: bool(s.pendingReboot),
@@ -134,6 +155,7 @@ async function checkin(b, headers) {
     tags: prev?.tags || [], depState: prev?.depState || {},
     pendingRebootSince: r.security.pendingReboot ? (prev?.pendingRebootSince || now) : null,
     agentErrors: (arr(b.errors, 20) || []).map(e => cut(e, 300)),
+    publicIp: clientIp(headers),
   };
   if (Array.isArray(b.software)) { doc.software = b.software.slice(0, 3000).map(s => ({ name: cut(s?.name, 200), version: cut(s?.version, 60), publisher: cut(s?.publisher, 100) })).filter(s => s.name); doc.softwareAt = now; }
   if (b.updates) doc.updates = { scannedAt: date(b.updates.scannedAt) || now, missing: (b.updates.missing || []).slice(0, 500).filter(u => u && str(u.id, 80)).map(cleanUpdate), installed: (b.updates.installed || []).slice(0, 1000).filter(u => u && str(u.id, 80)).map(cleanUpdate) };
@@ -195,7 +217,7 @@ async function commandResult(b, headers) {
 const EDITABLE = ['collection', 'app', 'deployment', 'updateGroup', 'adr', 'baseline', 'maintenanceWindow', 'script', 'site', 'settings'];
 const publicDevice = ({ keyHash, ...d }) => d;
 
-async function consoleState(user) {
+async function consoleState(user, headers) {
   await ensureDefaults();
   const ctx = await loadCtx(true);
   const [docs, scripts, alerts, logs, commands, scriptRuns] = await Promise.all([
@@ -205,7 +227,7 @@ async function consoleState(user) {
   return {
     status: 200,
     body: {
-      now: Date.now(), version: VERSION, storage: db.kind, user,
+      now: Date.now(), version: VERSION, storage: db.kind, user, viewerIp: clientIp(headers),
       enrollmentConfigured: Boolean(process.env.AGENT_ENROLL_TOKEN),
       devices: docs.map(d => M.deviceView(d, ctx)), updates: M.updateCatalogue(docs),
       ...ctx, scripts, alerts, log: logs, commands, scriptRuns,
@@ -224,6 +246,11 @@ async function putObject(kind, id, body, user) {
   if (kind !== 'baseline' && kind !== 'settings' && !str(doc.name, 200)) return { status: 400, body: { error: 'name is required' } };
   if (kind === 'collection') doc.builtIn = false;
   if (kind === 'settings') doc = { ...DEFAULTS.settings, ...(existing || {}), ...doc, id: 'main' };
+  if (kind === 'settings') {
+    const gw = String(doc.rdGateway || '').trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
+    if (gw && !/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:\d{1,5})?$/.test(gw)) return { status: 400, body: { error: 'rdGateway must be a host name, optionally with :port' } };
+    doc.rdGateway = gw.toLowerCase();
+  }
   await db.putObject(kind, id, doc);
   ctxCache = null;
   if (str(body.audit, 300)) await log(body.auditSource || 'Console', body.audit, 'info', user);
@@ -301,7 +328,7 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
     const user = `${p.userDetails}`;
     if (route === 'GET /api/console/me') return { status: 200, body: { user, provider: p.identityProvider, admin: isAdmin(p), adminConfigured: adminList().length > 0 } };
     if (!isAdmin(p)) return { status: 403, body: { error: `${user} is not a Device Manager admin`, user } };
-    if (route === 'GET /api/console/state') return consoleState(user);
+    if (route === 'GET /api/console/state') return consoleState(user, headers);
     if (route === 'GET /api/console/enrollment') return { status: 200, body: { token: process.env.AGENT_ENROLL_TOKEN || null } };
     if (route === 'POST /api/console/commands') return createCommands(body || {}, user);
     if (route === 'POST /api/console/alerts/ack') {

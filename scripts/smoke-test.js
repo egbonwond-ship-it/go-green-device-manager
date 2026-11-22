@@ -120,6 +120,35 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal((await call('POST', '/api/console/commands', { type: 'reboot-now', deviceIds: [id] })).status, 400, 'unknown command type rejected');
   console.log('✓ commands: platform check, single delivery, results, deployment status, alerts, remote desktop');
 
+  // ---------- remote desktop inside and outside the domain
+  const RC = await import(pathToFileURL(path.join(__dirname, '../app/js/remote-connect.js')));
+  r = await call('POST', '/api/agent/checkin', { ...report, deviceId: id, joinType: 'Domain', domain: 'ggt.local', netbiosDomain: 'GGT', fqdn: 'GGT-LAG-LT001.ggt.local.', ips: ['10.10.4.20', '100.101.5.6', 'nonsense'], rdpPort: 3389, user: 'GGT\\ada', tailscale: { ips: ['100.101.5.6', 'fd7a:115c:a1e0::1'], dnsName: 'ggt-lag-lt001.tail1234.ts.net.', online: true } }, { ...KEY2, 'x-forwarded-for': '102.89.1.10:51234, 10.0.0.1' });
+  assert.equal(r.status, 200);
+  r = await call('GET', '/api/console/state', null, { ...ADMIN, 'x-forwarded-for': '102.89.1.10' });
+  let rd = r.body.devices[0];
+  assert.equal(r.body.viewerIp, '102.89.1.10'); assert.equal(rd.publicIp, '102.89.1.10', 'public address from the check-in, port stripped');
+  assert.equal(rd.fqdn, 'ggt-lag-lt001.ggt.local'); assert.deepEqual(rd.ips, ['10.10.4.20', '100.101.5.6'], 'invalid addresses dropped');
+  assert.equal(rd.tailscale.dnsName, 'ggt-lag-lt001.tail1234.ts.net');
+  let rt = RC.route(rd, { viewerIp: '102.89.1.10' });
+  assert.equal(rt.address.value, 'ggt-lag-lt001.ggt.local', 'same network + domain: connect by domain name (Kerberos)');
+  assert.equal(RC.suggestedUser(rd), 'GGT\\ada');
+  rt = RC.route(rd, { viewerIp: '41.58.0.9' });
+  assert.equal(rt.address.value, 'ggt-lag-lt001.tail1234.ts.net', 'another network: connect over Tailscale');
+  const wg = { ...rd, joinType: 'Workgroup', domain: 'WORKGROUP', fqdn: '', user: 'GGT-LAG-LT001\\ada', tailscale: null, ips: ['192.168.1.40'] };
+  assert.equal(RC.route(wg, { viewerIp: '102.89.1.10' }).address.value, '192.168.1.40', 'workgroup PC: connect by address');
+  assert.equal(RC.suggestedUser(wg), 'GGT-LAG-LT001\\ada', 'workgroup PC: sign in with a local account');
+  assert.equal(RC.route(wg, { viewerIp: '41.58.0.9', gateway: 'rdg.example.com' }).gateway, true, 'another network without Tailscale: use the gateway');
+  assert.equal(RC.route(wg, { viewerIp: '41.58.0.9' }).warn, true, 'no Tailscale or gateway: warn about VPN');
+  assert.equal(RC.suggestedUser({ ...wg, joinType: 'Entra', user: 'AzureAD\\AdaObi' }), 'AzureAD\\AdaObi');
+  let f = RC.rdpFile(wg, { address: 'ggt-lag-lt001.tail1234.ts.net', port: 3390, user: '.\\ada', entra: true, gateway: 'rdg.example.com' });
+  assert.ok(f.includes('full address:s:ggt-lag-lt001.tail1234.ts.net:3390') && f.includes('username:s:.\\ada') && f.includes('enablerdsaadauth:i:1') && f.includes('gatewayhostname:s:rdg.example.com'));
+  assert.ok(RC.rdpFile(wg).includes('full address:s:10.10.4.20\r\n'), 'default port left out');
+  assert.equal(RC.vncUrl({ ip: '10.0.0.5' }, { user: 'ada', address: '100.64.0.2' }), 'vnc://ada@100.64.0.2');
+  assert.equal((await call('PUT', '/api/console/objects/settings/main', { doc: { id: 'main', rdGateway: 'bad host!' } })).status, 400, 'gateway validated');
+  r = await call('PUT', '/api/console/objects/settings/main', { doc: { id: 'main', rdGateway: 'https://RDG.example.com/' } });
+  assert.equal(r.body.doc.rdGateway, 'rdg.example.com');
+  console.log('✓ remote desktop: domain, workgroup, Entra, Tailscale, gateway');
+
   // ---------- console rule logic matches the server's
   const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));
   const sample = M.deviceView({ id: 'a', name: 'GGT-ABJ-DT004', platform: 'Windows', os: 'Windows 10 Pro 22H2', build: '19045', type: 'Desktop', tags: ['pilot'], ip: '10.20.1.1', lastSeen: new Date().toISOString() }, { sites: [{ name: 'Abuja', code: 'ABJ', subnets: '10.20.0.0/16' }], apps: [], settings: {} });

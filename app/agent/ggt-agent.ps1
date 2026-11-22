@@ -29,7 +29,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.1.0'
+$AgentVersion = '2.2.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -103,9 +103,15 @@ function Get-Inventory {
   if ("$($cs.Model) $($cs.Manufacturer)" -match 'Virtual|VMware|KVM|QEMU|HVM|Xen|innotek|Amazon EC2|Google Compute') { $type = 'VM' }
   elseif ($os.ProductType -ne 1) { $type = 'Server' }
   elseif ($cs.PCSystemType -eq 2) { $type = 'Laptop' }
-  $net = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Where-Object { $_.DefaultIPGateway } | Select-Object -First 1
-  if (-not $net) { $net = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Select-Object -First 1 }
+  $nets = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True')
+  $net = $nets | Where-Object { $_.DefaultIPGateway } | Select-Object -First 1
+  if (-not $net) { $net = $nets | Select-Object -First 1 }
   $ip = if ($net) { @($net.IPAddress | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })[0] } else { $null }
+  # Every IPv4 address (LAN, Wi-Fi, VPN, Tailscale), primary first, so remote desktop can pick one that's reachable.
+  $ips = @($nets | ForEach-Object { $_.IPAddress } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_ -notmatch '^(127\.|169\.254\.)' } | Select-Object -Unique)
+  if ($ip) { $ips = @($ip) + @($ips | Where-Object { $_ -ne $ip }) }
+  $join = Get-JoinInfo $cs
+  $rdpPort = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name PortNumber -ErrorAction SilentlyContinue).PortNumber
   $load = ($cpus | Measure-Object -Property LoadPercentage -Average).Average
   $freePct = if ($disk.Size) { [math]::Round($disk.FreeSpace / $disk.Size * 100) } else { $null }
   return [ordered]@{
@@ -116,7 +122,42 @@ function Get-Inventory {
     cpuPct = if ($null -ne $load) { [math]::Round($load) } else { $null }
     memPct = [math]::Round(100 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100))
     agentVersion = $AgentVersion
+    joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
+    ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale
   }
+}
+
+# How the PC signs people in: joined to Active Directory, to Microsoft Entra ID, both, or neither (workgroup).
+# Remote desktop uses this to suggest the right account format (DOMAIN\user, AzureAD\user or PC\user).
+function Get-JoinInfo($cs) {
+  $reg = @{}
+  try { (& dsregcmd.exe /status 2>$null) | ForEach-Object { if ($_ -match '^\s*(\w+)\s*:\s*(.+?)\s*$') { $reg[$Matches[1]] = $Matches[2] } } } catch { }
+  $entra = $reg['AzureAdJoined'] -eq 'YES'
+  $dns = "$($cs.DNSHostName)"; if (-not $dns) { $dns = $env:COMPUTERNAME }
+  if ($cs.PartOfDomain) {
+    $nb = $null
+    if ("$($cs.UserName)" -match '^([^\\]+)\\' -and $Matches[1] -ne $env:COMPUTERNAME -and $Matches[1] -ne 'AzureAD') { $nb = $Matches[1] }
+    if (-not $nb) { try { $nb = @(Get-CimInstance Win32_NTDomain -ErrorAction Stop | Where-Object { $_.DnsForestName -and $_.DomainName })[0].DomainName } catch { } }
+    return @{ joinType = $(if ($entra) { 'Hybrid' } else { 'Domain' }); domain = "$($cs.Domain)"; netbiosDomain = $nb; fqdn = "$dns.$($cs.Domain)".ToLower() }
+  }
+  $suffix = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name Domain -ErrorAction SilentlyContinue).Domain
+  return @{
+    joinType = $(if ($entra) { 'Entra' } else { 'Workgroup' })
+    domain = $(if ($entra) { $reg['TenantName'] } else { "$($cs.Workgroup)" })
+    netbiosDomain = $null
+    fqdn = $(if ($suffix) { "$dns.$suffix".ToLower() } else { $null })
+  }
+}
+
+# Tailscale (mesh VPN) address and MagicDNS name, so remote desktop works when the PC is outside the office.
+function Get-Tailscale {
+  $exe = @((Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source, "$env:ProgramFiles\Tailscale\tailscale.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+  if (-not $exe) { return $null }
+  try {
+    $j = (& $exe status --json 2>$null | Out-String) | ConvertFrom-Json
+    if (-not $j.Self) { return $null }
+    return @{ ips = @($j.Self.TailscaleIPs | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }); dnsName = "$($j.Self.DNSName)".TrimEnd('.'); online = [bool]($j.BackendState -eq 'Running') }
+  } catch { return $null }
 }
 
 function Get-Security {

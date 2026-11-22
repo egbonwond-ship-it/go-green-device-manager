@@ -11,6 +11,8 @@ export default function settings(el) {
     <div class="grid g2"><div class="card"><div class="card-title"><h3>Sites & boundaries</h3><button class="btn sm" id="addsite">Add site</button></div><p class="small muted" style="margin-bottom:8px">A device belongs to the site whose IP range contains its address. Others show as “Unassigned”.</p><ul class="list" id="sites"></ul></div>
       <div class="stack"><div class="card stack"><h3>Approved local administrators</h3><p class="small muted">Accounts allowed in the local Administrators group (Windows) or admin/sudo groups (macOS/Linux). Any other member fails the “Local administrators” compliance rule and raises an alert when added. One per line; names match with or without a DOMAIN\\ prefix.</p>
         <textarea id="admins" rows="5" class="mono"></textarea><div><button class="btn sm primary" id="saveadm">Save list</button></div></div>
+        <div class="card stack"><h3>Remote desktop</h3><p class="small muted">Optional. A Remote Desktop Gateway at the office, for Windows connections to devices on another network that don’t have Tailscale. Leave empty if you don’t have one.</p>
+        <label class="field">Remote Desktop Gateway<input id="rdgw" class="mono" placeholder="rdgateway.go-greentechnologies.com"></label><div><button class="btn sm primary" id="savegw">Save gateway</button></div></div>
         <div class="card stack"><h3>Server</h3><div id="api" class="small"></div></div></div></div>`;
   const mw = () => {
     el.querySelector('#mw').innerHTML = `<div class="table-scroll"><table class="data plain"><thead><tr><th>Name</th><th>Collection</th><th>Days</th><th>Start (WAT)</th><th>Duration</th><th>Applies to</th><th></th></tr></thead><tbody>
@@ -27,7 +29,8 @@ export default function settings(el) {
       <div><span>Enrolled devices</span><b>${st.devices.length}</b></div><div><span>Console admins</span><b>Set by the ADMIN_USERS setting in Azure</b></div></div>`;
   };
   const admins = () => { const t = el.querySelector('#admins'); if (document.activeElement !== t) t.value = (S.state.settings.approvedAdmins || []).join('\n'); };
-  const all = () => { mw(); sites(); server(); admins(); };
+  const gw = () => { const t = el.querySelector('#rdgw'); if (document.activeElement !== t) t.value = S.state.settings.rdGateway || ''; };
+  const all = () => { mw(); sites(); server(); admins(); gw(); };
   all();
   el.querySelector('#enrol').addEventListener('click', enrolHelp);
   el.querySelector('#mw').addEventListener('click', e => { const b = e.target.closest('[data-del]'); if (b) { S.deleteMaintenanceWindow(b.dataset.del); mw(); } });
@@ -35,6 +38,11 @@ export default function settings(el) {
   el.querySelector('#saveadm').addEventListener('click', () => {
     const list = [...new Set(el.querySelector('#admins').value.split(/\n|,/).map(s => s.trim()).filter(Boolean))];
     S.saveSettings({ approvedAdmins: list }, `Approved local administrators: ${list.join(', ') || 'none'}`); toast('Approved administrators saved');
+  });
+  el.querySelector('#savegw').addEventListener('click', () => {
+    const v = el.querySelector('#rdgw').value.trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase();
+    if (v && !/^[a-z0-9][a-z0-9.-]*(:\d{1,5})?$/.test(v)) { toast('Type the gateway’s name, for example rdgateway.example.com.', true); return; }
+    S.saveSettings({ rdGateway: v }, v ? `Remote Desktop Gateway set to ${v}` : 'Remote Desktop Gateway removed'); toast(v ? 'Gateway saved' : 'Gateway removed');
   });
   el.querySelector('#addsite').addEventListener('click', () => modal('Add site', `<div class="form-grid">
       <label class="field">Name<input id="n" placeholder="Lagos HQ"></label><label class="field">Code<input id="c" placeholder="LAG" maxlength="8"></label>

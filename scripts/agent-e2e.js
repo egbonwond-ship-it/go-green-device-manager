@@ -82,6 +82,10 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
     assert.ok(dev.ramGB > 0 && dev.diskGB > 0, 'hardware reported');
     assert.ok(dev.softwareCount > 0, 'software inventory reported');
     assert.ok(dev.online, 'online');
+    console.log('Remote desktop reach:', JSON.stringify({ joinType: dev.joinType, domain: dev.domain, fqdn: dev.fqdn, ips: dev.ips, rdpPort: dev.rdpPort, tailscale: dev.tailscale }));
+    assert.ok(['Domain', 'Hybrid', 'Entra', 'Workgroup'].includes(dev.joinType), 'domain or workgroup reported');
+    assert.ok(dev.ips.length > 0, 'addresses reported');
+    if (WIN) assert.ok(dev.rdpPort > 0, 'Remote Desktop port reported');
 
     // Deploy the test app to All Systems and run a script.
     await api('PUT', '/api/console/objects/app/app-e2e', { doc: TEST_APP });
