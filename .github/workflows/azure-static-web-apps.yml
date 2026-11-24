@@ -33,11 +33,72 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    # GitHub's hosted Macs are sometimes unavailable for hours, so a Mac run that fails or never starts
-    # still shows red on the PR but doesn't hold back a deploy that passed on Windows and Ubuntu.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: 20 }
+      - name: Agent end to end
+        run: node scripts/agent-e2e.js
+        env:
+          E2E_UPDATE_SCAN: ${{ matrix.os == 'windows-latest' && '0' || '1' }}
+      - name: Install with the downloadable setup file and schedule, then uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:PORT = '4290'
+          $server = Start-Process node -ArgumentList 'dev-server.js' -PassThru -NoNewWindow
+          Start-Sleep -Seconds 3
+          node scripts/make-setup.mjs windows http://localhost:4290 dev-token "$env:RUNNER_TEMP\GoGreenAgentSetup.cmd"
+          # The runner is already an administrator, so the setup runs in place; "< nul" answers its final "press a key".
+          $env:SETUP = "$env:RUNNER_TEMP\GoGreenAgentSetup.cmd"
+          cmd /c '%SETUP% < nul'
+          if ($LASTEXITCODE -ne 0) { throw "setup file exited with $LASTEXITCODE" }
+          $t = $null
+          for ($i = 0; $i -lt 60 -and -not $t; $i++) { Start-Sleep -Seconds 5; $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent' -ErrorAction SilentlyContinue }
+          if (-not $t) { throw 'setup file did not install the agent' }
+          $devices = @()
+          for ($i = 0; $i -lt 24 -and $devices.Count -lt 1; $i++) { Start-Sleep -Seconds 5; $devices = @((Invoke-RestMethod http://localhost:4290/api/console/state).devices) }
+          if ($devices.Count -ne 1) { throw "expected 1 enrolled device, got $($devices.Count)" }
+          "Enrolled by setup file: $($devices[0].name)"
+          $t = Get-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
+          "Task: $($t.TaskName) as $($t.Principal.UserId), state $($t.State)"
+          Start-ScheduledTask -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
+          Start-Sleep -Seconds 60
+          $info = Get-ScheduledTaskInfo -TaskPath '\Go-Green\' -TaskName 'GGT Agent'
+          "Scheduled run as SYSTEM finished with $($info.LastTaskResult)"
+          Get-Content "$env:ProgramData\GGT Agent\Logs\agent.log" -Tail 15
+          .\app\agent\ggt-agent.ps1 -Uninstall
+          if (Get-ScheduledTask -TaskPath '\Go-Green\' -ErrorAction SilentlyContinue) { throw 'task not removed' }
+          if (Test-Path "$env:ProgramData\GGT Agent") { throw 'folder not removed' }
+          Stop-Process -Id $server.Id
+      - name: Install with the downloadable setup file and schedule, then uninstall (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          PORT=4290 node dev-server.js & SERVER=$!
+          sleep 3
+          node scripts/make-setup.mjs unix http://localhost:4290 dev-token "$RUNNER_TEMP/go-green-agent-setup.sh"
+          sudo sh "$RUNNER_TEMP/go-green-agent-setup.sh"
+          curl -fsS http://localhost:4290/api/console/state | node -e "const s=JSON.parse(require('fs').readFileSync(0));if(s.devices.length!==1)throw new Error('expected 1 device, got '+s.devices.length);console.log('Enrolled by setup file:',s.devices[0].name)"
+          if [ "$RUNNER_OS" = "Linux" ]; then systemctl list-timers ggt-agent.timer --no-pager; sudo systemctl start ggt-agent.service; sudo tail -5 /var/log/ggt-agent.log; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then sudo launchctl list | grep com.go-green.ggt-agent; sleep 20; sudo tail -5 /Library/Logs/ggt-agent.log; fi
+          sudo python3 app/agent/ggt-agent.py uninstall
+          if [ "$RUNNER_OS" = "Linux" ] && [ -e /etc/systemd/system/ggt-agent.timer ]; then echo "timer not removed"; exit 1; fi
+          if [ "$RUNNER_OS" = "macOS" ] && [ -e /Library/LaunchDaemons/com.go-green.ggt-agent.plist ]; then echo "launchd job not removed"; exit 1; fi
+          kill $SERVER
+
+  # Windows Update scans can take a long time on fresh runners, so this check doesn't block deploys.
+  # The same run on a Mac. It is kept out of the deploy's needs because GitHub's hosted Macs are
+  # sometimes unavailable for hours; a Mac failure still shows red on the PR and the commit.
+  agent_macos:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
