@@ -5,7 +5,7 @@ const DAY = 86400000;
 const POLL_MS = 30000;
 const listeners = new Set();
 export let state = null;
-export const DEFAULT_STATE = { devices: [], updates: [], apps: [], collections: [], deployments: [], updateGroups: [], adrs: [], baselines: [], maintenanceWindows: [], scripts: [], sites: [], alerts: [], log: [], commands: [], scriptRuns: [], settings: { approvedAdmins: [] } };
+export const DEFAULT_STATE = { devices: [], updates: [], apps: [], collections: [], deployments: [], updateGroups: [], adrs: [], baselines: [], maintenanceWindows: [], scripts: [], osImages: [], taskSequences: [], sites: [], alerts: [], log: [], commands: [], scriptRuns: [], settings: { approvedAdmins: [] } };
 
 // Error codes agents commonly report (Windows Installer, Windows Update and the agent itself).
 export const ERRORS = {
@@ -23,7 +23,23 @@ export const ERRORS = {
   'DOWNLOAD': 'Installer download failed',
   'HASH': 'Installer file did not match its SHA-256',
   'WINGET': 'winget is not available on this device',
-  'TIMEOUT': 'Installer did not finish within 60 minutes',
+  'TIMEOUT': 'Installer or Windows setup did not finish in time',
+  // Windows OS deployment
+  'NOT_READY': 'The PC doesn’t meet the task sequence’s requirements',
+  'ROLLBACK': 'Windows setup rolled the upgrade back after restarting',
+  'TS_BROKEN': 'The task sequence refers to something that was deleted',
+  'MEDIA': 'The image isn’t Windows installation media',
+  'ARCH': 'The image is for a different processor type',
+  'BITLOCKER': 'BitLocker couldn’t be suspended',
+  'SCRIPT': 'A PowerShell step failed',
+  '0xC1900101': 'A driver stopped the upgrade. Update drivers (storage, network, graphics) and try again',
+  '0xC1900107': 'A previous upgrade still needs cleaning up. Restart the PC and try again',
+  '0xC1900200': 'The PC doesn’t meet the minimum requirements for this Windows version',
+  '0xC1900202': 'The PC doesn’t meet the minimum requirements for this Windows version',
+  '0xC1900204': 'Upgrade not possible from this edition or language. Use an image with the same edition and language',
+  '0xC1900208': 'An incompatible app is blocking the upgrade. Remove it, or allow compatibility warnings in the task sequence',
+  '0xC190020E': 'Not enough free disk space for the upgrade',
+  '0x80070490': 'A required component is missing or corrupt (try running DISM /RestoreHealth)',
 };
 
 // ---------- API ----------
@@ -220,6 +236,61 @@ export function adrMatches(r, d) {
     (!r.delayDays || (u.released || 0) <= now - r.delayDays * DAY));
 }
 
+// ---------- Windows OS deployment (same rules as api/src/lib/model.js) ----------
+export const OS_AGENT_MIN = '2.4.0';
+const verAtLeast = (v, min) => {
+  const a = String(v || '0').split('.').map(Number), b = min.split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((a[i] || 0) !== b[i]) return (a[i] || 0) > b[i]; }
+  return true;
+};
+export const buildNumber = d => parseInt(String(d.build || '').split('.')[0], 10) || 0;
+export function osNotMet(d) {
+  if (d.platform !== 'Windows') return 'Windows PCs only';
+  if (/server/i.test(d.os || '')) return 'Windows Server isn’t upgraded by task sequences';
+  if (!verAtLeast(d.agentVersion, OS_AGENT_MIN)) return `Needs agent ${OS_AGENT_MIN} or later. Reinstall the agent from Devices → Enrol devices.`;
+  return null;
+}
+export const osImage = id => byId('osImages', id);
+export const taskSequence = id => byId('taskSequences', id);
+export function tsTargetBuild(ts) {
+  const up = (ts?.steps || []).filter(s => s.type === 'upgrade').pop();
+  const img = up && osImage(up.imageId);
+  return img ? Number(img.build) || null : null;
+}
+// Windows 11 hardware check from what the agent reports: { ready: true|false|null, problems: [] }.
+// null means the agent hasn't reported enough to tell (agents before 2.4.0). The processor isn't checked.
+export function win11Readiness(d) {
+  if (d.platform !== 'Windows' || /server/i.test(d.os)) return { ready: null, problems: ['Not a Windows PC'] };
+  const r = d.osReady, p = [];
+  if (!r) return { ready: null, problems: ['Not reported yet (needs agent 2.4.0)'] };
+  if (r.tpm != null && Number(r.tpm) < 2) p.push(r.tpm === '0' ? 'No TPM' : `TPM ${r.tpm}`);
+  if (r.uefi === false) p.push('Legacy BIOS');
+  if (d.ramGB != null && d.ramGB < 4) p.push(`${d.ramGB} GB memory`);
+  if (d.diskGB != null && d.diskGB < 64) p.push(`${d.diskGB} GB disk`);
+  if (r.arch === 'x86') p.push('32-bit Windows');
+  return { ready: !p.length, problems: p };
+}
+export function saveOsImage(x) {
+  const isNew = !x.id;
+  if (isNew) { x.id = nid('os'); x.created = Date.now(); state.osImages.push(x); } else Object.assign(osImage(x.id), x);
+  hydrate(); emit();
+  return put('osImage', isNew ? x : osImage(x.id), `${isNew ? 'Added' : 'Changed'} Windows image ${x.name}`).then(() => refresh());
+}
+export function deleteOsImage(id) {
+  const x = osImage(id);
+  return del('osImage', id, `Deleted Windows image ${x.name}`).then(() => { state.osImages = state.osImages.filter(i => i.id !== id); emit(); });
+}
+export function saveTaskSequence(t) {
+  const isNew = !t.id;
+  if (isNew) { t.id = nid('ts'); t.created = Date.now(); state.taskSequences.push(t); } else Object.assign(taskSequence(t.id), t);
+  hydrate(); emit();
+  return put('taskSequence', isNew ? t : taskSequence(t.id), `${isNew ? 'Created' : 'Changed'} task sequence ${t.name} (${t.steps.length} steps)`).then(() => refresh());
+}
+export function deleteTaskSequence(id) {
+  const t = taskSequence(id);
+  return del('taskSequence', id, `Deleted task sequence ${t.name}`).then(() => { state.taskSequences = state.taskSequences.filter(i => i.id !== id); emit(); });
+}
+
 // ---------- deployments ----------
 export const STATUS = [
   ['success', 'Success', '#2f9e5a'], ['inprogress', 'In progress', '#4a90d9'], ['error', 'Error', '#d9483b'],
@@ -238,6 +309,12 @@ function computeResults(dep) {
       const a = app(dep.targetId);
       if (a && !a.platforms.includes(d.platform)) s = 'reqnotmet';
       else if (a) { const has = d.installed.includes(a.id); if (dep.action === 'Uninstall' ? !has : has) s = 'success'; }
+    } else if (dep.kind === 'os') {
+      const why = osNotMet(d);
+      const target = tsTargetBuild(taskSequence(dep.targetId));
+      if (why) { s = 'reqnotmet'; dep.messages[d.id] = why; }
+      else if (st?.state === 'success' || st?.state === 'reqnotmet') s = st.state;
+      else if (!st && target && buildNumber(d) >= target) { s = 'success'; dep.messages[d.id] = `Already on build ${buildNumber(d)}`; }
     } else {
       const g = byId('updateGroups', dep.targetId);
       if (d.updatesScannedAt && !(g?.updateIds || []).some(id => d.missingUpdates.includes(id))) s = 'success';
@@ -245,12 +322,12 @@ function computeResults(dep) {
     if (!s) s = st && ['error', 'inprogress'].includes(st.state) ? st.state : 'unknown';
     dep.results[d.id] = s;
     if (s === 'error') { dep.errors[d.id] = st.errorCode || 'Error'; dep.messages[d.id] = st.message || ''; }
-    else if (st?.message) dep.messages[d.id] = st.message;
+    else if (st?.message && !dep.messages[d.id]) dep.messages[d.id] = st.message;
   }
 }
 export function createDeployment(o) {
   const dep = { id: nid('dep'), created: Date.now(), createdBy: state.user, enabled: true, respectMW: true, restart: 'Suppress', action: 'Install', ...o };
-  const target = dep.kind === 'app' ? app(dep.targetId) : byId('updateGroups', dep.targetId);
+  const target = dep.kind === 'app' ? app(dep.targetId) : dep.kind === 'os' ? taskSequence(dep.targetId) : byId('updateGroups', dep.targetId);
   const col = byId('collections', dep.collectionId);
   dep.name = dep.name || `${target.name} → ${col.name}`;
   const { results, errors, messages, ...doc } = dep;

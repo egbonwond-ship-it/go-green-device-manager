@@ -250,6 +250,64 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal(M.inCidr('10.20.5.5', '10.20.0.0/16'), true); assert.equal(M.inCidr('10.21.5.5', '10.20.0.0/16'), false);
   console.log('✓ console and server collection rules agree');
 
+  // ---------- Windows OS deployment: images, task sequences, policy
+  {
+    useStore(memoryStore());
+    let st = (await call('GET', '/api/console/state')).body;
+    assert.ok(st.osImages.some(i => i.id === 'os-win11-latest' && i.source === 'assistant' && i.build === 26200), 'built-in Windows 11 image');
+    const ts0 = st.taskSequences.find(t => t.id === 'ts-win11-upgrade');
+    assert.deepEqual(ts0.steps.map(x => x.type), ['readiness', 'bitlocker', 'upgrade'], 'built-in upgrade task sequence');
+    const put = (kind, doc) => call('PUT', `/api/console/objects/${kind}/${doc.id}`, { doc });
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'usb', build: 26100 })).status, 400, 'image source checked');
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'iso', build: 26100, url: 'http://x/win.iso' })).status, 400, 'ISO must be https or a share');
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'iso', build: 99, url: 'https://x/win.iso' })).status, 400, 'build checked');
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'iso', build: 26100, url: 'https://x/win.iso', sha256: 'abc' })).status, 400, 'SHA-256 checked');
+    assert.equal((await put('osImage', { id: 'img-share', name: 'Share', source: 'iso', build: '26100', url: '\\\\GODC01\\Images\\Win11.iso' })).status, 200, 'network share accepted');
+    r = await put('osImage', { id: 'img1', name: 'Windows 11 Pro 24H2', source: 'iso', build: 26100, architecture: 'x64', url: 'https://files.example.com/Win11_24H2.iso', sha256: 'A'.repeat(64) });
+    assert.equal(r.status, 200); assert.equal(r.body.doc.build, 26100);
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Empty', steps: [] })).status, 400, 'steps required');
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Bad', steps: [{ type: 'format-disk' }] })).status, 400, 'step types checked');
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Bad', steps: [{ type: 'upgrade' }] })).status, 400, 'upgrade needs an image');
+    await put('app', { id: 'app-7z', name: '7-Zip', version: '24', detectName: '7-Zip', platforms: ['Windows'], windows: { wingetId: '7zip.7zip' } });
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Finance to 24H2', steps: [{ type: 'readiness', win11: true, minFreeGB: 30 }, { type: 'script', scriptId: 'gpupdate' }, { type: 'upgrade', imageId: 'img1', dynamicUpdate: false }, { type: 'app', appId: 'app-7z' }, { type: 'restart' }] })).status, 200);
+    await put('deployment', { id: 'dep-os', name: 'Win11', kind: 'os', targetId: 'ts1', collectionId: 'c-all', enabled: true, respectMW: false, restart: 'Allow' });
+    assert.equal((await call('DELETE', '/api/console/objects/osImage/img1')).status, 409, 'images used by task sequences cannot be deleted');
+    assert.equal((await call('DELETE', '/api/console/objects/taskSequence/ts1')).status, 409, 'deployed task sequences cannot be deleted');
+    assert.equal((await call('DELETE', '/api/console/objects/script/gpupdate')).status, 409, 'scripts used by task sequences cannot be deleted');
+
+    const H2 = { 'x-ggt-enroll-token': 'test-token' };
+    const win = { name: 'GGT-W10-01', platform: 'Windows', os: 'Windows 10 Pro 22H2', build: '19045.5131', type: 'Desktop', serial: 'W10', ip: '10.1.1.1', agentVersion: '2.4.0', ramGB: 8, diskGB: 256,
+      osReady: { tpm: '2.0', secureBoot: true, uefi: true, arch: 'x64', diskFreeGB: 120, junk: 'x' }, security: {} };
+    r = await call('POST', '/api/agent/checkin', win, H2);
+    const wk = { ...H2, 'x-ggt-device-key': r.body.deviceKey }, wid = r.body.deviceId;
+    const old = await call('POST', '/api/agent/checkin', { ...win, name: 'GGT-OLD', serial: 'OLD', agentVersion: '2.3.0' }, H2);
+    const srv = await call('POST', '/api/agent/checkin', { ...win, name: 'GGT-SRV', serial: 'SRV', os: 'Windows Server 2022 Standard', type: 'Server' }, H2);
+    let pol = (await call('GET', '/api/agent/policy', null, wk, { deviceId: wid })).body;
+    const od = pol.deployments.find(x => x.id === 'dep-os');
+    assert.equal(od.kind, 'os'); assert.equal(od.targetBuild, 26100); assert.equal(od.restart, 'Allow');
+    assert.deepEqual(od.taskSequence.steps.map(x => x.type), ['readiness', 'script', 'upgrade', 'app', 'restart']);
+    assert.equal(od.taskSequence.steps[1].body, 'gpupdate /force', 'script body sent');
+    assert.equal(od.taskSequence.steps[2].image.url, 'https://files.example.com/Win11_24H2.iso', 'image sent');
+    assert.equal(od.taskSequence.steps[2].dynamicUpdate, false);
+    assert.equal(od.taskSequence.steps[3].app.wingetId, '7zip.7zip', 'app step resolved for Windows');
+    assert.equal(od.taskSequence.broken, null);
+    for (const [who, label] of [[old, 'agents before 2.4.0'], [srv, 'Windows Server']]) {
+      const k = { ...H2, 'x-ggt-device-key': who.body.deviceKey };
+      assert.ok(!(await call('GET', '/api/agent/policy', null, k, { deviceId: who.body.deviceId })).body.deployments.some(x => x.kind === 'os'), `no task sequences for ${label}`);
+    }
+    assert.equal((await call('POST', '/api/agent/status', { deviceId: wid, deploymentId: 'dep-os', state: 'reqnotmet', errorCode: 'NOT_READY', message: 'Not ready: no TPM' }, wk)).status, 202);
+    st = (await call('GET', '/api/console/state')).body;
+    const dv = st.devices.find(d => d.id === wid);
+    assert.deepEqual(dv.osReady, { tpm: '2.0', secureBoot: true, uefi: true, arch: 'x64', diskFreeGB: 120 }, 'readiness stored without extra fields');
+    // The console marks results with the same rules as the server.
+    const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));
+    for (const d of st.devices) assert.equal(S.osNotMet(d), M.osNotMet(d), `${d.name}: console and server agree on who can run task sequences`);
+    assert.equal(S.win11Readiness(dv).ready, true);
+    assert.deepEqual(S.win11Readiness({ ...dv, osReady: { tpm: '1.2', uefi: false, arch: 'x64' } }).problems, ['TPM 1.2', 'Legacy BIOS']);
+    assert.equal(S.win11Readiness({ ...dv, osReady: null }).ready, null);
+    console.log('✓ OS deployment: images, task sequences, checks, policy, agent version and Server excluded, readiness');
+  }
+
   // ---------- storage outage
   useStore({ kind: 'broken', countDevices: async () => { throw new Error('down'); }, getDevice: async () => { throw new Error('down'); } });
   assert.equal((await call('GET', '/api/health', null, {})).status, 503);

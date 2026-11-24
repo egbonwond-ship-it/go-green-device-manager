@@ -147,6 +147,39 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
     st = await api('GET', '/api/console/state');
     assert.ok(!st.devices[0].installed.includes('app-e2e'), 'test app removed');
 
+    // Windows OS deployment: task sequences run step by step. This can't really upgrade the runner,
+    // so it checks a readiness failure, a full run of the other steps, a PC already on the target
+    // build, and an upgrade whose image can't be fetched.
+    if (WIN) {
+      console.log('Windows 11 readiness:', JSON.stringify(st.devices[0].osReady));
+      assert.ok(st.devices[0].osReady && ['x64', 'arm64'].includes(st.devices[0].osReady.arch), 'Windows 11 readiness reported');
+      await api('DELETE', '/api/console/objects/deployment/dep-e2e');
+      const put = (kind, doc) => api('PUT', `/api/console/objects/${kind}/${doc.id}`, { doc });
+      await put('osImage', { id: 'img-old', name: 'Old Windows', source: 'iso', build: 10240, url: 'https://example.com/old.iso' });
+      await put('osImage', { id: 'img-missing', name: 'Missing', source: 'iso', build: 99999, url: '\\\\localhost\\ggt-no-such-share\\win.iso' });
+      await put('taskSequence', { id: 'ts-ready', name: 'Needs a huge disk', steps: [{ type: 'readiness', minFreeGB: 100000 }, { type: 'restart' }] });
+      await put('taskSequence', { id: 'ts-run', name: 'Full run', steps: [{ type: 'readiness', minFreeGB: 1 }, { type: 'bitlocker' }, { type: 'script', scriptId: 'net' }, { type: 'app', appId: 'app-e2e' }] });
+      await put('taskSequence', { id: 'ts-done', name: 'Already upgraded', steps: [{ type: 'readiness', minFreeGB: 100000 }, { type: 'upgrade', imageId: 'img-old' }] });
+      await put('taskSequence', { id: 'ts-fetch', name: 'Unreachable image', steps: [{ type: 'upgrade', imageId: 'img-missing' }] });
+      for (const t of ['ts-ready', 'ts-run', 'ts-fetch', 'ts-done']) await put('deployment', { id: `dep-${t}`, name: t, kind: 'os', targetId: t, collectionId: 'c-all', enabled: true, respectMW: false, restart: 'Suppress' });
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      const ds = st.devices[0].depState;
+      console.log('Task sequences:', JSON.stringify({ ready: ds['dep-ts-ready'], run: ds['dep-ts-run'], fetch: ds['dep-ts-fetch'], done: ds['dep-ts-done'] }));
+      assert.equal(ds['dep-ts-ready']?.state, 'reqnotmet', 'readiness failure reported');
+      assert.equal(ds['dep-ts-ready'].errorCode, 'NOT_READY');
+      assert.equal(ds['dep-ts-run']?.state, 'success', 'task sequence ran every step');
+      assert.ok(st.devices[0].installed.includes('app-e2e'), 'the task sequence installed the app');
+      assert.equal(ds['dep-ts-fetch']?.state, 'error', 'unreachable image reported');
+      assert.ok(['DOWNLOAD', '0x80070070'].includes(ds['dep-ts-fetch'].errorCode), `image error code ${ds['dep-ts-fetch'].errorCode}`);
+      assert.equal(ds['dep-ts-done']?.state, 'success', 'a PC already on the target build counts as done');
+      assert.match(ds['dep-ts-done'].message || '', /Already on Windows build/);
+      // A finished task sequence doesn't run again.
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      assert.equal(st.devices[0].depState['dep-ts-run'].at, ds['dep-ts-run'].at, 'finished task sequence not rerun');
+    }
+
     if (SCAN) {
       const d3 = st.devices[0];
       console.log('Update scan:', d3.updatesScannedAt ? `${d3.missingUpdates.length} missing, ${d3.installedUpdates.length} installed` : 'not reported', JSON.stringify(st.updates.slice(0, 3)));

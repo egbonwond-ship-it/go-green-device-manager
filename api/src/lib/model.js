@@ -76,6 +76,7 @@ function deviceView(doc, ctx, now = Date.now()) {
     installedUpdates: (doc.updates?.installed || []).map(u => u.id),
     updatesScannedAt: ms(doc.updates?.scannedAt),
     depState: doc.depState || {},
+    osReady: doc.osReady || null,
   };
   return v;
 }
@@ -141,6 +142,30 @@ function windowOpen(mw, now = Date.now()) {
 }
 
 const isWorkstation = d => d.type === 'Laptop' || d.type === 'Desktop';
+
+// ---------- Windows OS deployment (same logic as app/js/store.js) ----------
+// Task sequences run on Windows 10/11 PCs (not Windows Server) whose agent is new enough to run them;
+// older agents would mistake an OS deployment for something else.
+const OS_AGENT_MIN = '2.4.0';
+const verAtLeast = (v, min) => {
+  const a = String(v || '0').split('.').map(Number), b = min.split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((a[i] || 0) !== b[i]) return (a[i] || 0) > b[i]; }
+  return true;
+};
+const buildNumber = d => parseInt(String(d.build || '').split('.')[0], 10) || 0;
+// Why a task sequence can't run on a device, or null when it can.
+function osNotMet(d) {
+  if (d.platform !== 'Windows') return 'Windows PCs only';
+  if (/server/i.test(d.os || '')) return 'Windows Server isn’t upgraded by task sequences';
+  if (!verAtLeast(d.agentVersion, OS_AGENT_MIN)) return `Needs agent ${OS_AGENT_MIN} or later. Reinstall the agent from Devices → Enrol devices.`;
+  return null;
+}
+// The Windows build a task sequence upgrades to (its last upgrade step), or null if it doesn't upgrade.
+function tsTargetBuild(ts, images) {
+  const up = (ts?.steps || []).filter(s => s.type === 'upgrade').pop();
+  const img = up && (images || []).find(i => i.id === up.imageId);
+  return img ? Number(img.build) || null : null;
+}
 const PLATFORM_KEY = { Windows: 'windows', macOS: 'macos', Linux: 'linux' };
 
 // What one agent should do now.
@@ -162,6 +187,29 @@ function buildPolicy(doc, ctx, commands = [], now = Date.now()) {
       const a = appsById[d.targetId];
       if (!a || !(a.platforms || []).includes(doc.platform)) continue;
       deployments.push({ ...base, action: d.action || 'Install', app: { id: a.id, name: a.name, version: a.version, detectName: a.detectName, ...(a[PLATFORM_KEY[doc.platform]] || {}) } });
+    } else if (d.kind === 'os') {
+      const ts = (ctx.taskSequences || []).find(x => x.id === d.targetId);
+      if (!ts || osNotMet(doc)) continue;
+      const steps = [];
+      let broken = null;
+      for (const st of ts.steps || []) {
+        if (st.type === 'readiness') steps.push({ type: 'readiness', win11: !!st.win11, minFreeGB: Number(st.minFreeGB) || 0 });
+        else if (st.type === 'bitlocker' || st.type === 'restart') steps.push({ type: st.type });
+        else if (st.type === 'script') {
+          const sc = (ctx.scripts || []).find(x => x.id === st.scriptId && x.lang === 'PowerShell');
+          if (!sc) { broken = 'A Run PowerShell step’s script was deleted'; break; }
+          steps.push({ type: 'script', name: sc.name, body: sc.body });
+        } else if (st.type === 'app') {
+          const a = appsById[st.appId];
+          if (!a || !(a.platforms || []).includes('Windows')) { broken = 'An Install application step’s application was deleted or has no Windows install method'; break; }
+          steps.push({ type: 'app', app: { id: a.id, name: a.name, version: a.version, detectName: a.detectName, ...(a.windows || {}) } });
+        } else if (st.type === 'upgrade') {
+          const img = (ctx.osImages || []).find(x => x.id === st.imageId);
+          if (!img) { broken = 'The Upgrade Windows step’s image was deleted'; break; }
+          steps.push({ type: 'upgrade', image: { id: img.id, name: img.name, build: Number(img.build) || 0, architecture: img.architecture || 'x64', source: img.source, url: img.url || null, sha256: img.sha256 || null }, dynamicUpdate: st.dynamicUpdate !== false, ignoreCompat: !!st.ignoreCompat });
+        }
+      }
+      deployments.push({ ...base, action: 'Install', taskSequence: { id: ts.id, name: ts.name, steps, broken }, targetBuild: tsTargetBuild(ts, ctx.osImages) });
     } else if (d.kind === 'updates') {
       const g = (ctx.updateGroups || []).find(x => x.id === d.targetId);
       const ids = (g?.updateIds || []).filter(id => catalogue.has(id));
@@ -186,4 +234,4 @@ function buildPolicy(doc, ctx, commands = [], now = Date.now()) {
   };
 }
 
-module.exports = { deviceView, updateCatalogue, ruleMatch, inCollection, windowOpen, buildPolicy, osFamily, inCidr, extraAdmins, ONLINE_MS };
+module.exports = { osNotMet, tsTargetBuild, buildNumber, verAtLeast, OS_AGENT_MIN, deviceView, updateCatalogue, ruleMatch, inCollection, windowOpen, buildPolicy, osFamily, inCidr, extraAdmins, ONLINE_MS };

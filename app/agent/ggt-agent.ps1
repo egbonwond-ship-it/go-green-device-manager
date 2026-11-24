@@ -13,7 +13,8 @@
     2. scans Windows Update for missing updates (every 6 hours, or when asked),
     3. checks in, then pulls its policy from the Device Manager,
     4. runs queued scripts and actions, fixes settings for baselines with remediation on,
-       installs or removes deployed applications and installs approved updates,
+       installs or removes deployed applications, installs approved updates and runs Windows
+       upgrade task sequences (which carry on across restarts),
     5. reports each result back.
   Files: C:\ProgramData\GGT Agent (config.json holds the device key; only SYSTEM and Administrators can read it).
 #>
@@ -29,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.3.0'
+$AgentVersion = '2.4.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -124,6 +125,7 @@ function Get-Inventory {
     agentVersion = $AgentVersion
     joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
     ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected; ggvpn = Get-GoGreenVpn
+    osReady = Get-OsReadiness
   }
 }
 
@@ -494,11 +496,203 @@ function Invoke-Remediation($Ids, $Settings, $Sec) {
   return @{ done = $script:remediated; errors = $script:remediateErrors }
 }
 
-function Request-Restart {
+function Request-Restart([string]$Why = 'to finish installing updates') {
   if ($script:restartRequested) { return }
   $script:restartRequested = $true
-  Write-Log 'Restarting in 5 minutes'
-  & shutdown.exe /r /t 300 /c "Go-Green IT: this computer restarts in 5 minutes to finish installing updates. Save your work." /d p:2:17 | Out-Null
+  Write-Log "Restarting in 5 minutes $Why"
+  & shutdown.exe /r /t 300 /c "Go-Green IT: this computer restarts in 5 minutes $Why. Save your work." /d p:2:17 | Out-Null
+}
+
+# ---------------------------------------------------------------- Windows OS deployment
+# Windows 11 hardware requirements the agent can check (the processor list isn't checked here;
+# Windows setup checks it and the deployment shows its error code).
+function Get-OsReadiness {
+  $r = [ordered]@{ tpm = $null; secureBoot = $null; uefi = $null; arch = $null; diskFreeGB = $null }
+  try {
+    $t = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction Stop
+    $r.tpm = if ($t) { (("$(@($t)[0].SpecVersion)" -split ',')[0]).Trim() } else { '0' }
+    if (-not $r.tpm) { $r.tpm = '0' }
+  } catch { }
+  $sb = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction SilentlyContinue
+  if ($sb) { $r.uefi = $true; $r.secureBoot = ($sb.UEFISecureBootEnabled -eq 1) }
+  else { try { $r.secureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop); $r.uefi = $true } catch [System.PlatformNotSupportedException] { $r.uefi = $false; $r.secureBoot = $false } catch { } }
+  $a = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+  $r.arch = switch ($a) { 'AMD64' { 'x64' } 'ARM64' { 'arm64' } 'x86' { 'x86' } default { $null } }
+  $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+  if ($disk) { $r.diskFreeGB = [math]::Round($disk.FreeSpace / 1GB) }
+  return $r
+}
+function Get-WindowsBuild { [int](Get-CimInstance Win32_OperatingSystem).BuildNumber }
+function Get-BootMs { ([DateTimeOffset](Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUnixTimeMilliseconds() }
+function New-StepError([string]$Code, [string]$Message) { $e = New-Object Exception($Message); $e.Data['code'] = $Code; return $e }
+
+# Problems that stop this PC running the task sequence, as text; none means ready.
+function Test-OsReadiness($Step) {
+  $p = @()
+  $rd = Get-OsReadiness
+  if ($Step.minFreeGB -and $null -ne $rd.diskFreeGB -and $rd.diskFreeGB -lt $Step.minFreeGB) { $p += "only $($rd.diskFreeGB) GB free on $env:SystemDrive (needs $($Step.minFreeGB) GB)" }
+  if ($Step.win11) {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+    if ($null -ne $rd.tpm -and [double]$rd.tpm -lt 2) { $p += $(if ($rd.tpm -eq '0') { 'no TPM (Windows 11 needs TPM 2.0; turn it on in the firmware settings if the PC has one)' } else { "TPM $($rd.tpm) (Windows 11 needs TPM 2.0)" }) }
+    if ($rd.uefi -eq $false) { $p += 'starts in legacy BIOS mode (Windows 11 needs UEFI with Secure Boot)' }
+    if ($cs.TotalPhysicalMemory -lt 3.8GB) { $p += "$([math]::Round($cs.TotalPhysicalMemory / 1GB, 1)) GB of memory (needs 4 GB)" }
+    if ($disk -and $disk.Size -lt 60GB) { $p += "a $([math]::Round($disk.Size / 1GB)) GB system drive (needs 64 GB)" }
+    if ($rd.arch -eq 'x86') { $p += '32-bit Windows (Windows 11 is 64-bit only)' }
+  }
+  return $p
+}
+
+function Suspend-OsBitLocker {
+  $v = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction SilentlyContinue
+  if (-not $v -or $v.ProtectionStatus -ne 1) { return "BitLocker isn't protecting the system drive; nothing to suspend" }
+  # Suspended for 3 restarts: an upgrade restarts the PC two or three times.
+  $r = Invoke-CimMethod -InputObject $v -MethodName DisableKeyProtectors -Arguments @{ DisableCount = [uint32]3 }
+  if ($r.ReturnValue -ne 0) { throw (New-StepError 'BITLOCKER' ("Couldn't suspend BitLocker (0x{0:X8})" -f $r.ReturnValue)) }
+  return 'BitLocker suspended for 3 restarts'
+}
+
+# Gets the image onto this PC: an ISO from https or a network share (checked against its SHA-256),
+# or Microsoft's Windows 11 Installation Assistant (checked by its Microsoft signature).
+function Get-OsMedia($Image) {
+  $dir = Join-Path $AgentDir 'Cache\OS'
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  if ($Image.source -eq 'assistant') {
+    $file = Join-Path $dir 'Windows11InstallationAssistant.exe'
+    try { Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2171764' -OutFile $file -UseBasicParsing -TimeoutSec 1800 } catch { throw (New-StepError 'DOWNLOAD' $_.Exception.Message) }
+    Import-SecurityModule
+    $sig = Get-AuthenticodeSignature $file
+    if ($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'O=Microsoft Corporation') { Remove-Item $file -Force; throw (New-StepError 'HASH' "The Installation Assistant isn't signed by Microsoft") }
+    return $file
+  }
+  $file = Join-Path $dir "$($Image.id).iso"
+  $hashOk = { param($f) -not $Image.sha256 -or (Get-FileHash $f -Algorithm SHA256).Hash -eq "$($Image.sha256)".ToUpper() }
+  if ((Test-Path $file) -and (& $hashOk $file)) { Write-Log 'Using the cached Windows image'; return $file }
+  Remove-Item $file -Force -ErrorAction SilentlyContinue
+  $free = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
+  if ($free -lt 20GB) { throw (New-StepError '0x80070070' "Only $([math]::Round($free / 1GB)) GB free: the image and the upgrade need about 20 GB") }
+  Write-Log "Downloading the Windows image from $($Image.url)"
+  try {
+    if ("$($Image.url)".StartsWith('\\')) { Copy-Item -LiteralPath $Image.url -Destination $file -Force }
+    else { Invoke-WebRequest -Uri $Image.url -OutFile $file -UseBasicParsing -TimeoutSec 7200 }
+  } catch { Remove-Item $file -Force -ErrorAction SilentlyContinue; throw (New-StepError 'DOWNLOAD' $_.Exception.Message) }
+  if (-not (& $hashOk $file)) { Remove-Item $file -Force; throw (New-StepError 'HASH' "The Windows image didn't match its SHA-256") }
+  return $file
+}
+
+# Runs Windows setup from the image as an in-place upgrade (apps, files and settings stay).
+# Setup prepares everything while Windows runs, then finishes during the next restart.
+function Invoke-OsUpgrade($Step) {
+  $img = $Step.image
+  $logs = Join-Path $AgentDir 'Logs\OSUpgrade'
+  if (-not (Test-Path $logs)) { New-Item -ItemType Directory -Path $logs -Force | Out-Null }
+  $arch = (Get-OsReadiness).arch
+  if ($img.architecture -and $arch -and $arch -ne $img.architecture) { throw (New-StepError 'ARCH' "This is an $arch PC and the image is $($img.architecture)") }
+  $media = Get-OsMedia $img
+  if ($img.source -eq 'assistant') {
+    $r = Invoke-Process $media @('/QuietInstall', '/SkipEULA', '/auto', 'upgrade', '/NoRestartUI', '/copylogs', "`"$logs`"") 9000
+    if ($r.timedOut) { throw (New-StepError 'TIMEOUT' "The Installation Assistant didn't finish within 2.5 hours") }
+    if ($r.exitCode -ne 0) { throw (New-StepError ('0x{0:X8}' -f $r.exitCode) "The Installation Assistant stopped with exit code $('0x{0:X8}' -f $r.exitCode)") }
+    return "The Windows 11 Installation Assistant is upgrading this PC and restarts it when it's ready"
+  }
+  $mount = Mount-DiskImage -ImagePath $media -PassThru
+  try {
+    $letter = ($mount | Get-Volume).DriveLetter
+    $setup = if ($letter) { "$($letter):\setup.exe" } else { $null }
+    if (-not $setup -or -not (Test-Path $setup)) { throw (New-StepError 'MEDIA' 'No setup.exe on the image. Use Windows installation media (an ISO from Microsoft or your volume licensing site).') }
+    $sargs = @('/auto', 'upgrade', '/quiet', '/eula', 'accept', '/noreboot', '/dynamicupdate', $(if ($Step.dynamicUpdate) { 'enable' } else { 'disable' }), '/showoobe', 'none', '/telemetry', 'disable', '/bitlocker', 'alwayssuspend', '/copylogs', "`"$logs`"")
+    if ($Step.ignoreCompat) { $sargs += @('/compat', 'ignorewarning') }
+    Write-Log "Running Windows setup: $setup $($sargs -join ' ')"
+    $r = Invoke-Process $setup $sargs 9000
+  } finally { Dismount-DiskImage -ImagePath $media -ErrorAction SilentlyContinue | Out-Null }
+  if ($r.timedOut) { throw (New-StepError 'TIMEOUT' "Windows setup didn't finish within 2.5 hours") }
+  if (@(0, 3, 3010) -notcontains $r.exitCode) {
+    $code = '0x{0:X8}' -f $r.exitCode
+    throw (New-StepError $code "Windows setup stopped with $code. Its logs are in $logs. $(Get-SetupError)")
+  }
+  return 'Windows setup has prepared the upgrade. It finishes during the next restart (30-90 minutes).'
+}
+# The last lines of Windows setup's error log, to explain a failed or rolled-back upgrade.
+function Get-SetupError {
+  foreach ($f in @("$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setuperr.log", "$env:SystemDrive\`$WINDOWS.~BT\Sources\Rollback\setuperr.log", "$env:WINDIR\Panther\setuperr.log")) {
+    if (Test-Path -LiteralPath $f) { return ((Get-Content -LiteralPath $f -Tail 3 -ErrorAction SilentlyContinue) -join ' ') -replace '\s+', ' ' }
+  }
+  return ''
+}
+
+# Runs a task sequence one step at a time. Progress is kept in the agent's state, so a sequence
+# carries on after the restarts its upgrade or restart steps need. Returns the deployment's new state.
+function Invoke-TaskSequence($Dep, $Prev, $Software) {
+  $ts = $Dep.taskSequence
+  $steps = @($ts.steps)
+  $n = $steps.Count
+  $now = Now-Ms
+  $build = Get-WindowsBuild
+  $st = @{ state = 'inprogress'; step = [int]$Prev.step; at = $now; stagedAt = $Prev.stagedAt; targetBuild = $Prev.targetBuild }
+  if ($ts.broken) { return @{ state = 'error'; code = 'TS_BROKEN'; message = "$($ts.broken). Edit the task sequence."; at = $now } }
+
+  # Waiting for a restart that an upgrade or a restart step asked for.
+  if ($Prev.state -eq 'staged' -or $Prev.state -eq 'restarting') {
+    if ((Get-BootMs) -le [int64]$Prev.stagedAt) {
+      # The deployment was changed to allow restarts after setup had prepared the upgrade.
+      if ($Prev.state -eq 'staged' -and $Dep.restart -eq 'Allow' -and -not $Prev.restartAsked) { Request-Restart 'to finish upgrading Windows'; $Prev.restartAsked = $true; $Prev.quiet = $true; return $Prev }
+      return $null # still waiting; nothing new to report
+    }
+    if ($Prev.state -eq 'staged' -and $Prev.targetBuild -and $build -lt [int]$Prev.targetBuild) {
+      # The assistant restarts more than once; give it a day before calling it a failure.
+      $busy = Get-Process -Name 'Windows10UpgraderApp', 'SetupHost' -ErrorAction SilentlyContinue
+      if ($busy -and ($now - [int64]$Prev.stagedAt) -lt 86400000) { return $null }
+      return @{ state = 'error'; code = 'ROLLBACK'; message = "Windows is still on build $build after restarting, so setup rolled the upgrade back. $(Get-SetupError)"; at = $now }
+    }
+    $st.step = [int]$Prev.step + 1
+  } elseif ($Prev.state -ne 'inprogress') { $st.step = 0 }
+
+  # Already on the version this sequence upgrades to.
+  if ($st.step -eq 0 -and $Dep.targetBuild -and $build -ge [int]$Dep.targetBuild) { return @{ state = 'success'; message = "Already on Windows build $build"; at = $now } }
+
+  for ($i = $st.step; $i -lt $n; $i++) {
+    $s = $steps[$i]
+    $label = "Step $($i + 1) of ${n}"
+    Send-Status $Dep.id 'inprogress' $null "${label}: $($s.type)"
+    Write-Log "Task sequence $($ts.name): $label ($($s.type))"
+    try {
+      switch ($s.type) {
+        'readiness' {
+          $p = @(Test-OsReadiness $s)
+          if ($p.Count) { return @{ state = 'reqnotmet'; code = 'NOT_READY'; message = "Not ready: $($p -join '; ')"; at = $now } }
+        }
+        'bitlocker' { Write-Log (Suspend-OsBitLocker) }
+        'script' {
+          $p = Invoke-PowerShellText $s.body 3600
+          if ($p.timedOut -or $p.exitCode -ne 0) { throw (New-StepError 'SCRIPT' "'$($s.name)' exited with $($p.exitCode). $(("$($p.output)" -split "`n" | Select-Object -Last 2) -join ' ')") }
+        }
+        'app' {
+          if (-not (Test-Detected $s.app.detectName $Software)) {
+            $r = Install-App @{ app = $s.app; action = 'Install' } $Software
+            $Software = Get-Software
+            if (-not $r.ok) { throw (New-StepError "$($r.code)" "$($s.app.name): $($r.message)") }
+            if (-not (Test-Detected $s.app.detectName $Software)) { throw (New-StepError 'NOT_DETECTED' "$($s.app.name) installed but wasn't detected") }
+          }
+        }
+        'restart' {
+          Request-Restart 'to continue setting up Windows'
+          return @{ state = 'restarting'; step = $i; stagedAt = Now-Ms; at = $now; message = "${label}: restarting" }
+        }
+        'upgrade' {
+          if ($build -ge [int]$s.image.build) { Write-Log "Already on build $build; skipping the upgrade"; break }
+          $msg = Invoke-OsUpgrade $s
+          if ($Dep.restart -eq 'Allow' -and $s.image.source -ne 'assistant') { Request-Restart 'to finish upgrading Windows' }
+          $wait = if ($Dep.restart -eq 'Allow' -or $s.image.source -eq 'assistant') { $msg } else { "$msg Waiting for the user to restart." }
+          return @{ state = 'staged'; step = $i; stagedAt = Now-Ms; targetBuild = [int]$s.image.build; restartAsked = ($Dep.restart -eq 'Allow'); at = $now; message = "${label}: $wait" }
+        }
+      }
+    } catch {
+      $code = if ($_.Exception.Data['code']) { $_.Exception.Data['code'] } else { 'ERROR' }
+      return @{ state = 'error'; code = $code; message = "${label} ($($s.type)): $($_.Exception.Message)"; at = $now }
+    }
+  }
+  $done = Get-WindowsBuild
+  return @{ state = 'success'; message = "Task sequence finished. Windows build $done."; at = $now }
 }
 
 # ---------------------------------------------------------------- one cycle
@@ -595,6 +789,22 @@ function Invoke-Cycle {
   foreach ($d in @($policy.deployments)) {
     if (-not $d) { continue }
     $prev = To-Hash $deps[$d.id]
+    if ($d.kind -eq 'os') {
+      if ($prev.state -eq 'success' -or ($prev.state -eq 'reqnotmet' -and [int64]$prev.at -gt [int64]$d.retryAt -and ($now - [int64]$prev.at) -lt 86400000)) { continue }
+      $waiting = $prev.state -eq 'staged' -or $prev.state -eq 'restarting'
+      if (-not $waiting -and -not $d.allowedNow) { continue }
+      if ($prev.state -eq 'error' -and [int64]$prev.at -gt [int64]$d.retryAt -and ($now - [int64]$prev.at) -lt 86400000) { continue }
+      $res = Invoke-TaskSequence $d $prev $sw
+      if (-not $res) { continue }
+      if ($res.quiet) { $res.Remove('quiet'); $deps[$d.id] = $res; continue }
+      $deps[$d.id] = $res
+      $changed = $true
+      $sendState = if ($res.state -eq 'staged' -or $res.state -eq 'restarting') { 'inprogress' } else { $res.state }
+      Send-Status $d.id $sendState $(if ($res.state -eq 'error' -or $res.state -eq 'reqnotmet') { $res.code } else { $null }) $res.message
+      Write-Log "Task sequence $($d.name): $($res.state) $($res.message)"
+      $sw = Get-Software
+      continue
+    }
     if ($d.kind -eq 'app') {
       $want = $d.action -ne 'Uninstall'
       if ((Test-Detected $d.app.detectName $sw) -eq $want) {

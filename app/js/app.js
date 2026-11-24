@@ -13,10 +13,11 @@ import reports from './views/reports.js';
 import settings from './views/settings.js';
 import remote from './views/remote.js';
 import vpn from './views/vpn.js';
+import osd from './views/osd.js';
 
 const NAV = [
   ['Estate', [['overview', 'Overview', '◎', overview], ['devices', 'Devices', '▣', devices], ['collections', 'Collections', '⧉', collections]]],
-  ['Deliver', [['library', 'Software library', '⬚', library], ['deployments', 'Deployments', '➜', deployments], ['updates', 'Software updates', '⟳', updates], ['remote', 'Remote desktop', '▭', remote], ['vpn', 'VPN', '⛨', vpn]]],
+  ['Deliver', [['library', 'Software library', '⬚', library], ['deployments', 'Deployments', '➜', deployments], ['updates', 'Software updates', '⟳', updates], ['osd', 'Operating systems', '⊞', osd], ['remote', 'Remote desktop', '▭', remote], ['vpn', 'VPN', '⛨', vpn]]],
   ['Protect', [['compliance', 'Compliance', '✓', compliance], ['monitoring', 'Monitoring & alerts', '♥', monitoring], ['scripts', 'Run scripts', '›_', scripts]]],
   ['Insight', [['reports', 'Reports', '▤', reports], ['settings', 'Administration', '⚙', settings]]],
 ];

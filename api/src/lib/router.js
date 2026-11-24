@@ -10,7 +10,7 @@ const { createStore } = require('./storage');
 const M = require('./model');
 const DEFAULTS = require('./defaults');
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 let db = createStore();
 const useStore = s => { db = s; ctxCache = null; };
 
@@ -58,7 +58,7 @@ async function alert(severity, title, detail, deviceId = null) {
 
 // Console configuration, cached briefly per API instance so agent check-ins stay cheap.
 let ctxCache = null;
-const CTX_KINDS = { sites: 'site', apps: 'app', collections: 'collection', deployments: 'deployment', updateGroups: 'updateGroup', adrs: 'adr', baselines: 'baseline', maintenanceWindows: 'maintenanceWindow' };
+const CTX_KINDS = { sites: 'site', apps: 'app', collections: 'collection', deployments: 'deployment', updateGroups: 'updateGroup', adrs: 'adr', baselines: 'baseline', maintenanceWindows: 'maintenanceWindow', scripts: 'script', osImages: 'osImage', taskSequences: 'taskSequence' };
 async function loadCtx(fresh = false) {
   if (!fresh && ctxCache && Date.now() - ctxCache.at < 30000) return ctxCache.ctx;
   const ctx = {};
@@ -74,21 +74,23 @@ async function ensureDefaults() {
   await db.putMany('collection', DEFAULTS.collections);
   await db.putMany('baseline', DEFAULTS.baselines);
   await db.putMany('script', DEFAULTS.scripts);
-  await db.putMany('app', DEFAULTS.apps.map(a => ({ ...a, created: Date.now() })));
-  await db.putObject('settings', 'main', { ...DEFAULTS.settings, seededApps: DEFAULTS.apps.map(a => a.id) });
-  await log('Setup', 'Created the built-in collections, compliance baselines, scripts and library applications');
+  for (const [kind, list] of BUILT_INS) await db.putMany(kind, DEFAULTS[list].map(a => ({ ...a, created: Date.now() })));
+  await db.putObject('settings', 'main', { ...DEFAULTS.settings, seededApps: BUILT_INS.flatMap(([, list]) => DEFAULTS[list].map(a => a.id)) });
+  await log('Setup', 'Created the built-in collections, compliance baselines, scripts, library applications, Windows images and task sequences');
   return true;
 }
 
-// Adds built-in library applications that this console hasn't had yet, once each.
+// Built-in library applications, Windows images and task sequences that this console hasn't had yet
+// are added once each; one an admin deleted isn't added again.
+const BUILT_INS = [['app', 'apps'], ['osImage', 'osImages'], ['taskSequence', 'taskSequences']];
 async function ensureBuiltInApps(settings) {
   const seeded = Array.isArray(settings.seededApps) ? settings.seededApps : [];
-  const todo = DEFAULTS.apps.filter(a => !seeded.includes(a.id));
+  const todo = BUILT_INS.flatMap(([kind, list]) => DEFAULTS[list].filter(a => !seeded.includes(a.id)).map(a => [kind, a]));
   if (!todo.length) return;
-  for (const a of todo) if (!(await db.getObject('app', a.id))) await db.putObject('app', a.id, { ...a, created: Date.now() });
-  await db.putObject('settings', 'main', { ...settings, seededApps: [...seeded, ...todo.map(a => a.id)] });
+  for (const [kind, a] of todo) if (!(await db.getObject(kind, a.id))) await db.putObject(kind, a.id, { ...a, created: Date.now() });
+  await db.putObject('settings', 'main', { ...settings, seededApps: [...seeded, ...todo.map(([, a]) => a.id)] });
   ctxCache = null;
-  await log('Setup', `Added ${todo.map(a => a.name).join(', ')} to the software library`);
+  await log('Setup', `Added ${todo.map(([, a]) => a.name).join(', ')}`);
 }
 
 // ---------- sign-in (Azure Static Web Apps puts the signed-in user in x-ms-client-principal) ----------
@@ -117,6 +119,11 @@ function sanitizeReport(b) {
     tailscale: b.tailscale && typeof b.tailscale === 'object' ? { ips: ipList(b.tailscale.ips), dnsName: host(b.tailscale.dnsName), online: bool(b.tailscale.online) } : null,
     ggvpn: b.ggvpn && typeof b.ggvpn === 'object' && WG_KEY.test(b.ggvpn.publicKey || '')
       ? { publicKey: b.ggvpn.publicKey, address: net.isIPv4(b.ggvpn.address || '') ? b.ggvpn.address : null, up: bool(b.ggvpn.up), handshakeAgeSec: num(b.ggvpn.handshakeAgeSec, 0, 1e9) } : null,
+    // Windows 11 hardware requirements the agent can check.
+    osReady: b.osReady && typeof b.osReady === 'object' ? {
+      tpm: /^\d+(\.\d+)?$/.test(String(b.osReady.tpm || '')) ? String(b.osReady.tpm) : null, secureBoot: bool(b.osReady.secureBoot), uefi: bool(b.osReady.uefi),
+      arch: ['x64', 'arm64', 'x86'].includes(b.osReady.arch) ? b.osReady.arch : null, diskFreeGB: num(b.osReady.diskFreeGB, 0, 1e7),
+    } : null,
     security: {
       encrypted: bool(s.encrypted), avOn: bool(s.avOn), fwOn: bool(s.fwOn), defsAgeDays: num(s.defsAgeDays, 0, 10000),
       screenLockMin: num(s.screenLockMin, 0, 100000), usbBlocked: bool(s.usbBlocked), pendingReboot: bool(s.pendingReboot),
@@ -340,14 +347,37 @@ async function commandResult(b, headers) {
 }
 
 // ---------- console ----------
-const EDITABLE = ['collection', 'app', 'deployment', 'updateGroup', 'adr', 'baseline', 'maintenanceWindow', 'script', 'site', 'settings'];
+const EDITABLE = ['collection', 'app', 'deployment', 'updateGroup', 'adr', 'baseline', 'maintenanceWindow', 'script', 'site', 'settings', 'osImage', 'taskSequence'];
+const STEP_TYPES = ['readiness', 'bitlocker', 'script', 'app', 'upgrade', 'restart'];
+const SHA256 = /^[A-Fa-f0-9]{64}$/;
+// Windows images and task sequences are checked here because agents run them as SYSTEM.
+function checkOs(kind, doc) {
+  if (kind === 'osImage') {
+    if (!['iso', 'assistant'].includes(doc.source)) return 'source must be iso or assistant';
+    if (!(Number.isInteger(Number(doc.build)) && Number(doc.build) >= 10240 && Number(doc.build) < 100000)) return 'build must be a Windows build number, e.g. 26100';
+    doc.build = Number(doc.build);
+    if (!['x64', 'arm64'].includes(doc.architecture || 'x64')) return 'architecture must be x64 or arm64';
+    if (doc.source === 'iso') {
+      const u = String(doc.url || '').trim();
+      if (!/^https:\/\/\S+$/i.test(u) && !/^\\\\[^\\\s]+\\\S+$/.test(u)) return 'The ISO location must start with https:// or be a network share path like \\\\server\\share\\Win11.iso';
+      doc.url = u;
+      if (doc.sha256 && !SHA256.test(doc.sha256)) return 'sha256 must be 64 hex characters';
+    } else { delete doc.url; delete doc.sha256; }
+  }
+  if (kind === 'taskSequence') {
+    if (!Array.isArray(doc.steps) || !doc.steps.length || doc.steps.length > 30) return 'A task sequence needs 1 to 30 steps';
+    if (doc.steps.some(s => !s || !STEP_TYPES.includes(s.type))) return `Step types are ${STEP_TYPES.join(', ')}`;
+    if (doc.steps.some(s => (s.type === 'upgrade' && !str(s.imageId, 64)) || (s.type === 'script' && !str(s.scriptId, 64)) || (s.type === 'app' && !str(s.appId, 64)))) return 'Every step needs its image, script or application';
+  }
+  return null;
+}
 const publicDevice = ({ keyHash, ...d }) => d;
 
 async function consoleState(user, headers) {
   await ensureDefaults();
   const ctx = await loadCtx(true);
-  const [docs, scripts, alerts, logs, commands, scriptRuns] = await Promise.all([
-    db.listDevices(), db.listObjects('script'), db.listObjects('alert', { limit: 200 }), db.listObjects('log', { limit: 300 }),
+  const [docs, alerts, logs, commands, scriptRuns] = await Promise.all([
+    db.listDevices(), db.listObjects('alert', { limit: 200 }), db.listObjects('log', { limit: 300 }),
     db.listObjects('command', { limit: 300 }), db.listObjects('scriptRun', { limit: 50 }),
   ]);
   return {
@@ -358,7 +388,7 @@ async function consoleState(user, headers) {
       tailscaleKey: await vpnKeyInfo(),
       ggvpn: await vpnInfo(), vpnClients: await db.listObjects('vpnClient'),
       devices: docs.map(d => M.deviceView(d, ctx)), updates: M.updateCatalogue(docs),
-      ...ctx, scripts, alerts, log: logs, commands, scriptRuns,
+      ...ctx, alerts, log: logs, commands, scriptRuns,
     },
   };
 }
@@ -373,6 +403,8 @@ async function putObject(kind, id, body, user) {
   if (kind === 'baseline') { if (!existing) return { status: 404, body: { error: 'Unknown baseline' } }; doc = { ...existing, remediate: !!doc.remediate }; }
   if (kind !== 'baseline' && kind !== 'settings' && !str(doc.name, 200)) return { status: 400, body: { error: 'name is required' } };
   if (kind === 'collection') doc.builtIn = false;
+  const osErr = checkOs(kind, doc);
+  if (osErr) return { status: 400, body: { error: osErr } };
   if (kind === 'settings') doc = { ...DEFAULTS.settings, ...(existing || {}), ...doc, id: 'main' };
   if (kind === 'settings') {
     const gw = String(doc.rdGateway || '').trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
@@ -394,8 +426,13 @@ async function deleteObject(kind, id, query, user) {
     const used = [...await db.listObjects('deployment', { where: { collectionId: id } }), ...await db.listObjects('adr', { where: { collectionId: id } }), ...await db.listObjects('maintenanceWindow', { where: { collectionId: id } })];
     if (used.length) return { status: 409, body: { error: 'Remove the deployments, rules and maintenance windows that use this collection first' } };
   }
-  if (kind === 'app' || kind === 'updateGroup') {
+  if (kind === 'app' || kind === 'updateGroup' || kind === 'taskSequence') {
     if ((await db.listObjects('deployment', { where: { targetId: id } })).length) return { status: 409, body: { error: 'Delete the deployments of this first' } };
+  }
+  if (kind === 'osImage' || kind === 'app' || kind === 'script') {
+    const key = { osImage: 'imageId', app: 'appId', script: 'scriptId' }[kind];
+    const uses = (await db.listObjects('taskSequence')).filter(t => (t.steps || []).some(s => s[key] === id));
+    if (uses.length) return { status: 409, body: { error: `Remove it from these task sequences first: ${uses.map(t => t.name).join(', ')}` } };
   }
   await db.deleteObject(kind, id);
   ctxCache = null;
