@@ -238,14 +238,9 @@ function Lock-Folder($Path) {
   Set-Acl -Path $Path -AclObject $acl
 }
 function Get-GgVpnPublicKey {
-  $keyFile = Join-Path $GgVpnDir 'private.key'
-  $wg = Find-Wg
-  if (-not $wg -or -not (Test-Path $keyFile)) { return $null }
-  $p = New-Object Diagnostics.Process
-  $p.StartInfo = New-Object Diagnostics.ProcessStartInfo -Property @{ FileName = $wg; Arguments = 'pubkey'; RedirectStandardInput = $true; RedirectStandardOutput = $true; UseShellExecute = $false; CreateNoWindow = $true }
-  $null = $p.Start(); $p.StandardInput.WriteLine((Get-Content $keyFile -Raw).Trim()); $p.StandardInput.Close()
-  $pub = $p.StandardOutput.ReadToEnd().Trim(); $p.WaitForExit()
-  if ($pub -match '^[A-Za-z0-9+/]{43}=$') { return $pub } else { return $null }
+  $pubFile = Join-Path $GgVpnDir 'public.key'
+  if (Test-Path $pubFile) { $pub = (Get-Content $pubFile -Raw).Trim(); if ($pub -match '^[A-Za-z0-9+/]{43}=$') { return $pub } }
+  return $null
 }
 function Get-GoGreenVpn {
   try {
@@ -262,7 +257,7 @@ function Get-GoGreenVpn {
       if ($hs -match '\s(\d+)$' -and [int64]$Matches[1] -gt 0) { $age = [int64]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$Matches[1]) }
     }
     return @{ publicKey = $pub; address = $addr; up = [bool]($svc -and $svc.Status -eq 'Running'); handshakeAgeSec = $age }
-  } catch { return $null }
+  } catch { Write-Log "Go-Green VPN status: $($_.Exception.Message)" 'warn'; return $null }
 }
 function Connect-GoGreenVpn($Vpn) {
   if (-not $Vpn -or -not $Vpn.address -or -not $Vpn.serverPublicKey -or -not $Vpn.endpoint) { throw 'The console did not send the VPN settings. Check the Go-Green VPN setup on the VPN page.' }
@@ -273,6 +268,9 @@ function Connect-GoGreenVpn($Vpn) {
   $keyFile = Join-Path $GgVpnDir 'private.key'
   if (-not (Test-Path $keyFile)) { Set-Content -Path $keyFile -Value ((& $wg genkey | Out-String).Trim()) -Encoding ASCII -NoNewline }
   $priv = (Get-Content $keyFile -Raw).Trim()
+  $pub = ("$priv" | & $wg pubkey | Out-String).Trim()
+  if ($pub -notmatch '^[A-Za-z0-9+/]{43}=$') { throw "Couldn't work out this PC's VPN public key." }
+  Set-Content -Path (Join-Path $GgVpnDir 'public.key') -Value $pub -Encoding ASCII
   $lines = @('[Interface]', "PrivateKey = $priv", "Address = $($Vpn.address)/32")
   if (@($Vpn.dns).Count) { $lines += "DNS = $(@($Vpn.dns) -join ', ')" }
   $lines += @('', '[Peer]', "PublicKey = $($Vpn.serverPublicKey)", "AllowedIPs = $(@($Vpn.routes) -join ', ')", "Endpoint = $($Vpn.endpoint)", 'PersistentKeepalive = 25')
