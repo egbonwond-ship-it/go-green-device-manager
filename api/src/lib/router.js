@@ -69,13 +69,26 @@ async function loadCtx(fresh = false) {
 }
 
 async function ensureDefaults() {
-  if (await db.getObject('settings', 'main')) return false;
+  const existing = await db.getObject('settings', 'main');
+  if (existing) { await ensureBuiltInApps(existing); return false; }
   await db.putMany('collection', DEFAULTS.collections);
   await db.putMany('baseline', DEFAULTS.baselines);
   await db.putMany('script', DEFAULTS.scripts);
-  await db.putObject('settings', 'main', DEFAULTS.settings);
-  await log('Setup', 'Created the built-in collections, compliance baselines and scripts');
+  await db.putMany('app', DEFAULTS.apps.map(a => ({ ...a, created: Date.now() })));
+  await db.putObject('settings', 'main', { ...DEFAULTS.settings, seededApps: DEFAULTS.apps.map(a => a.id) });
+  await log('Setup', 'Created the built-in collections, compliance baselines, scripts and library applications');
   return true;
+}
+
+// Adds built-in library applications that this console hasn't had yet, once each.
+async function ensureBuiltInApps(settings) {
+  const seeded = Array.isArray(settings.seededApps) ? settings.seededApps : [];
+  const todo = DEFAULTS.apps.filter(a => !seeded.includes(a.id));
+  if (!todo.length) return;
+  for (const a of todo) if (!(await db.getObject('app', a.id))) await db.putObject('app', a.id, { ...a, created: Date.now() });
+  await db.putObject('settings', 'main', { ...settings, seededApps: [...seeded, ...todo.map(a => a.id)] });
+  ctxCache = null;
+  await log('Setup', `Added ${todo.map(a => a.name).join(', ')} to the software library`);
 }
 
 // ---------- sign-in (Azure Static Web Apps puts the signed-in user in x-ms-client-principal) ----------
