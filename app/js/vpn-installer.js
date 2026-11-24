@@ -25,6 +25,7 @@ export function windowsVpnSetup(opts) {
   const ps = [
     '[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072',
     "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'",
+    "Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1') -ErrorAction SilentlyContinue",
     "$wgexe = Join-Path $env:ProgramFiles 'WireGuard\\wireguard.exe'",
     'if (-not (Test-Path $wgexe)) {',
     "  Write-Host 'Downloading WireGuard...'",

@@ -204,8 +204,12 @@ $GgVpnTunnel = 'GoGreenVPN'
 $GgVpnDir = Join-Path $AgentDir 'vpn'
 function Find-WireGuard { @("$env:ProgramFiles\WireGuard\wireguard.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1 }
 function Find-Wg { @("$env:ProgramFiles\WireGuard\wg.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+# Windows PowerShell's own security module (signatures, ACLs), loaded by path so a PSModulePath
+# inherited from PowerShell 7 can't hide it.
+function Import-SecurityModule { Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction SilentlyContinue }
 function Install-WireGuard {
   if (Find-WireGuard) { return }
+  Import-SecurityModule
   $arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'arm64' } 'x86' { 'x86' } default { 'amd64' } }
   $base = 'https://download.wireguard.com/windows-client/'
   try {
@@ -225,6 +229,7 @@ function Install-WireGuard {
 }
 function Lock-Folder($Path) {
   # Only SYSTEM and Administrators can read the VPN key.
+  Import-SecurityModule
   $acl = New-Object Security.AccessControl.DirectorySecurity
   $acl.SetAccessRuleProtection($true, $false)
   foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
