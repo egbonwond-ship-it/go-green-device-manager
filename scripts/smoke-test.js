@@ -170,6 +170,64 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal(r.body.set, false, 'key removed');
   console.log('✓ VPN: Tailscale key private, join command, FortiClient status');
 
+  // ---------- Go-Green VPN: addresses, keys, the VPN server's peer list
+  const crypto = require('crypto');
+  const wgPub = () => crypto.generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
+  assert.equal((await call('POST', '/api/console/commands', { type: 'ggvpnon', deviceIds: [id] })).status, 409, 'needs the server key first');
+  assert.equal((await call('POST', '/api/console/vpn/clients', { name: 'PC', platform: 'Windows' })).status, 409);
+  process.env.GGVPN_SERVER_PUBKEY = wgPub();
+  process.env.GGVPN_SYNC_TOKEN = 'sync-secret';
+  r = await call('GET', '/api/console/state');
+  assert.equal(r.body.ggvpn.configured, true); assert.equal(r.body.ggvpn.endpoint, 'vpn.go-greentechnologies.com:51820');
+  r = await call('POST', '/api/console/commands', { type: 'ggvpnon', deviceIds: [id] });
+  assert.equal(r.body.commands[0].status, 'queued');
+  r = await call('GET', '/api/agent/policy', null, KEY2, { deviceId: id });
+  const on = r.body.commands.find(c => c.type === 'ggvpnon');
+  assert.equal(on.vpn.address, '10.99.0.100', 'first address in the pool');
+  assert.equal(on.vpn.serverPublicKey, process.env.GGVPN_SERVER_PUBKEY);
+  assert.deepEqual(on.vpn.routes, ['10.99.0.0/24', '172.16.29.0/24']);
+  assert.equal((await call('GET', '/api/vpn/peers', null, {})).status, 401, 'peer list needs the sync token');
+  r = await call('GET', '/api/vpn/peers', null, { 'x-ggt-vpn-token': 'sync-secret' });
+  assert.equal(r.body.peers.length, 0, 'not listed until the device reports its key');
+  const devPub = wgPub();
+  await call('POST', '/api/agent/checkin', { ...report, deviceId: id, ggvpn: { publicKey: devPub, address: '10.99.0.100', up: true, handshakeAgeSec: 12 } }, KEY2);
+  await call('POST', '/api/agent/checkin', { ...report, deviceId: id, ggvpn: { publicKey: 'junk', up: true } }, KEY2).then(x => assert.equal(x.status, 200));
+  await call('POST', '/api/agent/checkin', { ...report, deviceId: id, ggvpn: { publicKey: devPub, address: '10.99.0.100', up: true, handshakeAgeSec: 12 } }, KEY2);
+  r = await call('GET', '/api/vpn/peers', null, { 'x-ggt-vpn-token': 'sync-secret' });
+  assert.deepEqual(r.body.peers.map(p => [p.address, p.publicKey]), [['10.99.0.100', devPub]], 'device listed with its own key');
+  r = await call('GET', '/api/console/state');
+  assert.equal(r.body.devices[0].ggvpn.wanted, true); assert.equal(r.body.devices[0].ggvpn.reported.up, true);
+  assert.ok(r.body.ggvpn.lastSync, 'last sync recorded');
+  // Installers: a key made once, returned once, never stored.
+  r = await call('POST', '/api/console/vpn/clients', { name: 'GGT Laptop 02', platform: 'macOS' });
+  assert.equal(r.status, 200); assert.equal(r.body.client.name, 'GGT-Laptop-02'); assert.equal(r.body.client.address, '10.99.0.101');
+  assert.match(r.body.privateKey, /^[A-Za-z0-9+/]{43}=$/);
+  const pk = crypto.createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b656e04220420', 'hex'), Buffer.from(r.body.privateKey, 'base64')]), format: 'der', type: 'pkcs8' });
+  assert.equal(crypto.createPublicKey(pk).export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64'), r.body.client.publicKey, 'public key matches the private key');
+  const secret = r.body.privateKey, clientId = r.body.client.id;
+  assert.equal((await call('POST', '/api/console/vpn/clients', { name: 'ggt-laptop-02', platform: 'Windows' })).status, 409, 'one installer per name');
+  assert.equal((await call('POST', '/api/console/vpn/clients', { name: 'x', platform: 'Linux' })).status, 400);
+  r = await call('GET', '/api/console/state');
+  assert.ok(!JSON.stringify(r.body).includes(secret), 'private key not stored');
+  assert.equal(r.body.vpnClients.length, 1);
+  r = await call('GET', '/api/vpn/peers', null, { 'x-ggt-vpn-token': 'sync-secret' });
+  assert.equal(r.body.peers.length, 2);
+  const V = await import(pathToFileURL(path.join(__dirname, '../app/js/vpn-installer.js')));
+  const server = { publicKey: process.env.GGVPN_SERVER_PUBKEY, endpoint: 'vpn.example.com:51820', dns: ['172.16.29.10'], routes: ['10.99.0.0/24'] };
+  const cmd = V.windowsVpnSetup({ name: 'PC', address: '10.99.0.101', privateKey: secret, server });
+  const psLine = cmd.split('\r\n').find(l => l.startsWith('powershell.exe -NoProfile -ExecutionPolicy'));
+  assert.ok(psLine.includes(`'PrivateKey = ${secret}'`) && !/(^|[^\\])"/.test(psLine.slice(psLine.indexOf('"') + 1, -1)), 'Windows installer: key inside, no stray quotes');
+  assert.match(V.vpnConf({ address: '10.99.0.101', privateKey: secret, server }), /Address = 10\.99\.0\.101\/32\nDNS = 172\.16\.29\.10\n/);
+  // Revoke and disconnect take peers off the list at once.
+  assert.equal((await call('DELETE', `/api/console/vpn/clients/${clientId}`)).status, 200);
+  await call('POST', '/api/console/commands', { type: 'ggvpnoff', deviceIds: [id] });
+  r = await call('GET', '/api/vpn/peers', null, { 'x-ggt-vpn-token': 'sync-secret' });
+  assert.equal(r.body.peers.length, 0, 'revoked and disconnected peers removed');
+  r = await call('POST', '/api/console/commands', { type: 'ggvpnon', deviceIds: [id] });
+  r = await call('GET', '/api/agent/policy', null, KEY2, { deviceId: id });
+  assert.equal(r.body.commands.find(c => c.type === 'ggvpnon').vpn.address, '10.99.0.100', 'reconnecting keeps the same address');
+  console.log('✓ Go-Green VPN: address pool, device keys, installers, peer sync, revoke');
+
   // ---------- console rule logic matches the server's
   const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));
   const sample = M.deviceView({ id: 'a', name: 'GGT-ABJ-DT004', platform: 'Windows', os: 'Windows 10 Pro 22H2', build: '19045', type: 'Desktop', tags: ['pilot'], ip: '10.20.1.1', lastSeen: new Date().toISOString() }, { sites: [{ name: 'Abuja', code: 'ABJ', subnets: '10.20.0.0/16' }], apps: [], settings: {} });

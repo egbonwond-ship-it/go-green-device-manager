@@ -102,6 +102,8 @@ function sanitizeReport(b) {
     fqdn: host(b.fqdn), ips: ipList(b.ips), rdpPort: num(b.rdpPort, 1, 65535),
     fortiConnected: bool(b.fortiConnected),
     tailscale: b.tailscale && typeof b.tailscale === 'object' ? { ips: ipList(b.tailscale.ips), dnsName: host(b.tailscale.dnsName), online: bool(b.tailscale.online) } : null,
+    ggvpn: b.ggvpn && typeof b.ggvpn === 'object' && WG_KEY.test(b.ggvpn.publicKey || '')
+      ? { publicKey: b.ggvpn.publicKey, address: net.isIPv4(b.ggvpn.address || '') ? b.ggvpn.address : null, up: bool(b.ggvpn.up), handshakeAgeSec: num(b.ggvpn.handshakeAgeSec, 0, 1e9) } : null,
     security: {
       encrypted: bool(s.encrypted), avOn: bool(s.avOn), fwOn: bool(s.fwOn), defsAgeDays: num(s.defsAgeDays, 0, 10000),
       screenLockMin: num(s.screenLockMin, 0, 100000), usbBlocked: bool(s.usbBlocked), pendingReboot: bool(s.pendingReboot),
@@ -203,6 +205,87 @@ async function saveTailscaleKey(b, user) {
   return { status: 200, body: await vpnKeyInfo() };
 }
 
+// ---------- Go-Green VPN: the company's own WireGuard server in Azure ----------
+// The server is set up with Azure application settings:
+//   GGVPN_SERVER_PUBKEY  the server's WireGuard public key (turns the feature on)
+//   GGVPN_ENDPOINT       host:port laptops connect to (default vpn.go-greentechnologies.com:51820)
+//   GGVPN_DNS            DNS servers inside the tunnel (default: the domain controllers)
+//   GGVPN_ROUTES         networks sent through the tunnel (default: VPN clients and the lab network)
+//   GGVPN_SYNC_TOKEN     shared with the VPN server, which pulls the peer list from /api/vpn/peers
+// Every VPN computer gets its own address from 10.99.0.100-249. Enrolled Windows and Linux devices
+// make their own key (it never leaves the device); a downloaded installer gets a key made here that
+// is returned once in the download and never stored.
+const WG_KEY = /^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$/;
+const VPN_POOL = { prefix: '10.99.0.', first: 100, last: 249 };
+const csv = v => String(v || '').split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+function vpnConfig() {
+  const pub = String(process.env.GGVPN_SERVER_PUBKEY || '').trim();
+  return {
+    configured: WG_KEY.test(pub), serverPublicKey: WG_KEY.test(pub) ? pub : null,
+    endpoint: String(process.env.GGVPN_ENDPOINT || 'vpn.go-greentechnologies.com:51820').trim(),
+    dns: csv(process.env.GGVPN_DNS || '172.16.29.10, 172.16.29.11').filter(a => net.isIP(a)),
+    routes: csv(process.env.GGVPN_ROUTES || '10.99.0.0/24, 172.16.29.0/24').filter(r => /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(r)),
+    syncConfigured: Boolean(process.env.GGVPN_SYNC_TOKEN),
+  };
+}
+async function vpnInfo() {
+  const c = vpnConfig();
+  const sync = await db.getObject('vpnSync', 'main');
+  return { configured: c.configured, endpoint: c.endpoint, dns: c.dns, routes: c.routes, syncConfigured: c.syncConfigured, lastSync: sync?.t || null, lastSyncPeers: sync?.count ?? null };
+}
+async function usedVpnAddresses() {
+  const [docs, clients] = await Promise.all([db.listDevices(), db.listObjects('vpnClient')]);
+  return new Set([...docs.map(d => d.ggvpnAddr), ...clients.map(c => c.address)].filter(Boolean));
+}
+function nextVpnAddress(used) {
+  for (let i = VPN_POOL.first; i <= VPN_POOL.last; i++) { const a = VPN_POOL.prefix + i; if (!used.has(a)) { used.add(a); return a; } }
+  return null;
+}
+function wgKeyPair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
+  const raw = (k, type) => k.export({ format: 'der', type }).subarray(-32).toString('base64');
+  return { publicKey: raw(publicKey, 'spki'), privateKey: raw(privateKey, 'pkcs8') };
+}
+const PEER_NAME = v => String(v || '').trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+async function createVpnClient(b, user) {
+  const c = vpnConfig();
+  if (!c.configured) return { status: 409, body: { error: 'The Go-Green VPN server isn’t set up in the Device Manager yet (GGVPN_SERVER_PUBKEY in Azure).' } };
+  const name = PEER_NAME(b.name);
+  if (!name) return { status: 400, body: { error: 'Give the computer a name, for example GGT-LAPTOP-02.' } };
+  if (!['Windows', 'macOS'].includes(b.platform)) return { status: 400, body: { error: 'platform must be Windows or macOS' } };
+  const clients = await db.listObjects('vpnClient');
+  if (clients.some(x => x.name.toLowerCase() === name.toLowerCase())) return { status: 409, body: { error: `There’s already a VPN installer for ${name}. Revoke it first to make a new one.` } };
+  const address = nextVpnAddress(await usedVpnAddresses());
+  if (!address) return { status: 409, body: { error: 'The VPN address range is full. Revoke installers you no longer use.' } };
+  const keys = wgKeyPair();
+  const client = { id: newId('vpn'), name, platform: b.platform, address, publicKey: keys.publicKey, created: Date.now(), by: user };
+  await db.putObject('vpnClient', client.id, client);
+  await log('VPN', `Created a Go-Green VPN installer for ${name} (${b.platform}, ${address})`, 'info', user);
+  return { status: 200, body: { client, privateKey: keys.privateKey, server: { publicKey: c.serverPublicKey, endpoint: c.endpoint, dns: c.dns, routes: c.routes } } };
+}
+async function revokeVpnClient(id, user) {
+  const c = await db.getObject('vpnClient', id);
+  if (!c) return { status: 404, body: { error: 'Unknown VPN installer' } };
+  await db.deleteObject('vpnClient', id);
+  await log('VPN', `Revoked the Go-Green VPN installer for ${c.name}. It stops connecting within a minute.`, 'warn', user);
+  return { status: 200, body: { deleted: true } };
+}
+// The VPN server calls this every minute and adds or removes peers to match.
+async function vpnPeers(headers) {
+  const token = process.env.GGVPN_SYNC_TOKEN;
+  if (!token) return { status: 503, body: { error: 'GGVPN_SYNC_TOKEN is not set' } };
+  if (!safeEqual(headers['x-ggt-vpn-token'], token)) return { status: 401, body: { error: 'Missing or invalid x-ggt-vpn-token header' } };
+  const [docs, clients] = await Promise.all([db.listDevices(), db.listObjects('vpnClient')]);
+  const peers = [
+    ...docs.filter(d => d.ggvpnWanted && d.ggvpnAddr && d.ggvpn?.publicKey).map(d => ({ name: PEER_NAME(d.name), publicKey: d.ggvpn.publicKey, address: d.ggvpnAddr, kind: 'device' })),
+    ...clients.map(c => ({ name: c.name, publicKey: c.publicKey, address: c.address, kind: 'installer' })),
+  ];
+  const seen = new Set();
+  const unique = peers.filter(p => !seen.has(p.publicKey) && seen.add(p.publicKey));
+  await db.putObject('vpnSync', 'main', { id: 'main', t: Date.now(), count: unique.length });
+  return { status: 200, body: { peers: unique } };
+}
+
 async function policy(query, headers) {
   const a = await deviceAuth(headers, query.deviceId);
   if (a.error) return a.error;
@@ -211,7 +294,9 @@ async function policy(query, headers) {
   if (queued.length) await db.putMany('command', queued.map(c => ({ ...c, status: 'sent', sentAt: Date.now() })));
   // The Tailscale auth key travels only inside a join command to the device it's for; it's never stored on the command.
   const key = queued.some(c => c.type === 'vpnjoin') ? await tailscaleKey() : null;
-  return { status: 200, body: M.buildPolicy(a.doc, ctx, queued.map(c => (c.type === 'vpnjoin' ? { ...c, authKey: key } : c))) };
+  const vc = vpnConfig();
+  const vpn = { address: a.doc.ggvpnAddr, serverPublicKey: vc.serverPublicKey, endpoint: vc.endpoint, dns: vc.dns, routes: vc.routes };
+  return { status: 200, body: M.buildPolicy(a.doc, ctx, queued.map(c => (c.type === 'vpnjoin' ? { ...c, authKey: key } : c.type === 'ggvpnon' ? { ...c, vpn } : c))) };
 }
 
 async function status(b, headers) {
@@ -258,6 +343,7 @@ async function consoleState(user, headers) {
       now: Date.now(), version: VERSION, storage: db.kind, user, viewerIp: clientIp(headers),
       enrollmentConfigured: Boolean(process.env.AGENT_ENROLL_TOKEN),
       tailscaleKey: await vpnKeyInfo(),
+      ggvpn: await vpnInfo(), vpnClients: await db.listObjects('vpnClient'),
       devices: docs.map(d => M.deviceView(d, ctx)), updates: M.updateCatalogue(docs),
       ...ctx, scripts, alerts, log: logs, commands, scriptRuns,
     },
@@ -305,12 +391,14 @@ async function deleteObject(kind, id, query, user) {
 }
 
 const PLATFORMS_FOR = { PowerShell: ['Windows'], Shell: ['macOS', 'Linux'] };
-const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop', vpnjoin: 'Join Tailscale', vpnleave: 'Leave Tailscale' };
+const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop', vpnjoin: 'Join Tailscale', vpnleave: 'Leave Tailscale', ggvpnon: 'Connect to the Go-Green VPN', ggvpnoff: 'Disconnect from the Go-Green VPN' };
+const GGVPN_PLATFORMS = ['Windows', 'Linux'];
 const REMOTE_PLATFORMS = ['Windows', 'macOS'];
 async function createCommands(b, user) {
   const ids = arr(b.deviceIds, 2000) || [];
   if (!ids.length) return { status: 400, body: { error: 'deviceIds is required' } };
-  if (!['script', 'restart', 'inventory', 'updscan', 'remoteon', 'remoteoff', 'vpnjoin', 'vpnleave'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory, updscan, remoteon, remoteoff, vpnjoin or vpnleave' } };
+  if (!['script', 'restart', 'inventory', 'updscan', 'remoteon', 'remoteoff', 'vpnjoin', 'vpnleave', 'ggvpnon', 'ggvpnoff'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory, updscan, remoteon, remoteoff, vpnjoin, vpnleave, ggvpnon or ggvpnoff' } };
+  if (b.type === 'ggvpnon' && !vpnConfig().configured) return { status: 409, body: { error: 'The Go-Green VPN server isn’t set up in the Device Manager yet (GGVPN_SERVER_PUBKEY in Azure).' } };
   if (b.type === 'vpnjoin' && !(await tailscaleKey())) return { status: 409, body: { error: 'Save a Tailscale auth key on the VPN page first' } };
   let script = null;
   if (b.type === 'script') { script = str(b.scriptId, 64) ? await db.getObject('script', b.scriptId) : null; if (!script) return { status: 404, body: { error: 'Unknown script' } }; }
@@ -325,11 +413,22 @@ async function createCommands(b, user) {
       return { ...c, lang: script.lang, body: script.body };
     }
     if (b.type.startsWith('remote') && !REMOTE_PLATFORMS.includes(d.platform)) return { ...c, status: 'skipped', output: `Remote desktop is managed on Windows and macOS only, not ${d.platform}.` };
+    if (b.type.startsWith('ggvpn') && !GGVPN_PLATFORMS.includes(d.platform)) return { ...c, status: 'skipped', output: 'On a Mac, download a Mac installer from the VPN page and open it in the WireGuard app.' };
     return c;
   });
+  // The Go-Green VPN: give each connecting device its own address, and stop listing disconnected ones.
+  if (b.type.startsWith('ggvpn')) {
+    const used = await usedVpnAddresses();
+    for (const c of cmds.filter(x => x.status === 'queued')) {
+      const d = devices.get(c.deviceId);
+      const addr = b.type === 'ggvpnon' ? d.ggvpnAddr || nextVpnAddress(used) : d.ggvpnAddr;
+      if (b.type === 'ggvpnon' && !addr) { c.status = 'skipped'; c.output = 'The VPN address range is full.'; continue; }
+      await db.upsertDevice({ ...d, ggvpnAddr: addr || null, ggvpnWanted: b.type === 'ggvpnon' });
+    }
+  }
   await db.putMany('command', cmds);
   await db.putObject('scriptRun', runId, { id: runId, t: now, type: b.type, script: script ? script.name : COMMAND_NAMES[b.type], count: cmds.length, by: user });
-  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : b.type.startsWith('vpn') ? 'VPN' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
+  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : b.type.startsWith('vpn') || b.type.startsWith('ggvpn') ? 'VPN' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
   return { status: 200, body: { runId, commands: cmds.map(({ body, ...c }) => c) } };
 }
 
@@ -352,6 +451,8 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
     return { status: 404, body: { error: 'Not found' } };
   }
 
+  if (route === 'GET /api/vpn/peers') return vpnPeers(headers);
+
   if (path.startsWith('/api/console/')) {
     const p = principal(headers);
     if (!p) return { status: 401, body: { error: 'Sign in first' } };
@@ -362,6 +463,9 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
     if (route === 'GET /api/console/enrollment') return { status: 200, body: { token: process.env.AGENT_ENROLL_TOKEN || null } };
     if (route === 'POST /api/console/commands') return createCommands(body || {}, user);
     if (route === 'PUT /api/console/vpn/tailscale-key') return saveTailscaleKey(body || {}, user);
+    if (route === 'POST /api/console/vpn/clients') return createVpnClient(body || {}, user);
+    const vm = /^\/api\/console\/vpn\/clients\/([\w-]{1,80})$/.exec(path);
+    if (vm && method === 'DELETE') return revokeVpnClient(vm[1], user);
     if (route === 'POST /api/console/alerts/ack') {
       const all = await db.listObjects('alert', { where: { ack: false }, limit: 1000 });
       const pick = body?.all ? all : all.filter(a => (body?.ids || []).includes(a.id));

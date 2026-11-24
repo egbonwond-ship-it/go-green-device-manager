@@ -9,6 +9,7 @@
   "routes": [
     { "route": "/api/agent/*", "allowedRoles": ["anonymous"] },
     { "route": "/api/health", "allowedRoles": ["anonymous"] },
+    { "route": "/api/vpn/*", "allowedRoles": ["anonymous"] },
     { "route": "/agent/*", "allowedRoles": ["anonymous"], "headers": { "Cache-Control": "no-cache" } },
     { "route": "/login.html", "allowedRoles": ["anonymous"] },
     { "route": "/styles.css", "allowedRoles": ["anonymous"] },

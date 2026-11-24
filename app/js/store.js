@@ -302,6 +302,13 @@ export function devicesAction(ids, action) {
 export function saveTailscaleKey(authKey) {
   return send('PUT', '/api/console/vpn/tailscale-key', { authKey }).then(r => { state.tailscaleKey = r; emit(); refresh(); return r; });
 }
+export function createVpnClient(name, platform) {
+  return send('POST', '/api/console/vpn/clients', { name, platform }).then(r => { refresh(); return r; });
+}
+export function revokeVpnClient(id) {
+  state.vpnClients = (state.vpnClients || []).filter(c => c.id !== id); emit();
+  return send('DELETE', `/api/console/vpn/clients/${encodeURIComponent(id)}`).then(r => { refresh(); return r; });
+}
 export const runCommands = runId => state.commands.filter(c => c.runId === runId);
 export function saveScript(s) {
   const isNew = !s.id;

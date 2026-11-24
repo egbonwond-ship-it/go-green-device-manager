@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.2.0'
+AGENT_VERSION = '2.3.0'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -259,6 +259,92 @@ def tailscale():
             'dnsName': (me.get('DNSName') or '').rstrip('.') or None, 'online': j.get('BackendState') == 'Running'}
 
 
+# ---------------------------------------------------------------- Go-Green VPN (WireGuard, Linux)
+# The company's own VPN server in Azure. The device makes its own WireGuard key, which never leaves
+# it; only the public key is reported, and the VPN server picks it up from the console within a minute.
+GGVPN_IF = 'ggvpn'
+GGVPN_CONF = '/etc/wireguard/%s.conf' % GGVPN_IF
+
+
+def ggvpn_dir():
+    return os.path.join(HOME, 'vpn')
+
+
+def ggvpn():
+    """The Go-Green VPN on this device: public key, address and whether the tunnel is up. None when not set up."""
+    if IS_MAC or not os.path.exists(GGVPN_CONF) or not shutil.which('wg'):
+        return None
+    key = read(os.path.join(ggvpn_dir(), 'private.key')).strip()
+    if not key:
+        return None
+    pub = subprocess.run(['wg', 'pubkey'], input=key + '\n', capture_output=True, text=True).stdout.strip()
+    if not re.match(r'^[A-Za-z0-9+/]{43}=$', pub):
+        return None
+    m = re.search(r'(?m)^Address\s*=\s*([0-9.]+)', read(GGVPN_CONF))
+    up = sh(['wg', 'show', GGVPN_IF])[0] == 0
+    age = None
+    if up:
+        hs = out(['wg', 'show', GGVPN_IF, 'latest-handshakes']).split()
+        if len(hs) >= 2 and hs[-1].isdigit() and int(hs[-1]) > 0:
+            age = max(0, int(time.time()) - int(hs[-1]))
+    return {'publicKey': pub, 'address': m.group(1) if m else None, 'up': up, 'handshakeAgeSec': age}
+
+
+def ggvpn_connect(vpn):
+    if IS_MAC:
+        raise RuntimeError('On a Mac, download a Mac installer from the VPN page and open it in the WireGuard app.')
+    if not vpn or not vpn.get('address') or not vpn.get('serverPublicKey') or not vpn.get('endpoint'):
+        raise RuntimeError('The console did not send the VPN settings. Check the Go-Green VPN setup on the VPN page.')
+    if not shutil.which('wg-quick'):
+        tool = pkg_tool() if (shutil.which('apt-get') or shutil.which('dnf') or shutil.which('yum')) else ('zypper' if shutil.which('zypper') else None)
+        cmd = {'apt-get': 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools',
+               'dnf': 'dnf install -y wireguard-tools', 'yum': 'yum install -y wireguard-tools', 'zypper': 'zypper -n install wireguard-tools'}.get(tool)
+        if not cmd:
+            raise RuntimeError('Install wireguard-tools on this device, then try again.')
+        code, text = sh(['/bin/sh', '-c', cmd], timeout=900)
+        if code != 0 or not shutil.which('wg-quick'):
+            raise RuntimeError('Installing wireguard-tools failed: %s' % text[-500:])
+    os.makedirs(ggvpn_dir(), mode=0o700, exist_ok=True)
+    key_path = os.path.join(ggvpn_dir(), 'private.key')
+    if not read(key_path).strip():
+        key = out(['wg', 'genkey']).strip()
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(key + '\n')
+    key = read(key_path).strip()
+    lines = ['[Interface]', 'PrivateKey = ' + key, 'Address = %s/32' % vpn['address']]
+    # wg-quick needs resolvconf to set DNS; without it the tunnel still works, with the device's own DNS.
+    if vpn.get('dns') and shutil.which('resolvconf'):
+        lines.append('DNS = ' + ', '.join(vpn['dns']))
+    lines += ['', '[Peer]', 'PublicKey = ' + vpn['serverPublicKey'], 'AllowedIPs = ' + ', '.join(vpn.get('routes') or []),
+              'Endpoint = ' + vpn['endpoint'], 'PersistentKeepalive = 25', '']
+    os.makedirs('/etc/wireguard', mode=0o700, exist_ok=True)
+    fd = os.open(GGVPN_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('\n'.join(lines))
+    sh(['wg-quick', 'down', GGVPN_IF], timeout=60)
+    if shutil.which('systemctl'):
+        sh(['systemctl', 'enable', 'wg-quick@' + GGVPN_IF], timeout=60)
+        code, text = sh(['systemctl', 'restart', 'wg-quick@' + GGVPN_IF], timeout=120)
+    else:
+        code, text = sh(['wg-quick', 'up', GGVPN_IF], timeout=120)
+    if code != 0:
+        raise RuntimeError("Couldn't start the VPN tunnel: %s" % text[-500:])
+    return 'Set up the Go-Green VPN as %s. It connects within about a minute, once the VPN server picks up this device, and starts again after a restart.' % vpn['address']
+
+
+def ggvpn_disconnect():
+    if IS_MAC:
+        raise RuntimeError('On a Mac, turn the tunnel off in the WireGuard app.')
+    if shutil.which('systemctl'):
+        sh(['systemctl', 'disable', '--now', 'wg-quick@' + GGVPN_IF], timeout=60)
+    if shutil.which('wg-quick'):
+        sh(['wg-quick', 'down', GGVPN_IF], timeout=60)
+    if os.path.exists(GGVPN_CONF):
+        os.remove(GGVPN_CONF)
+    return 'Disconnected from the Go-Green VPN and removed the tunnel. wireguard-tools is still installed.'
+
+
 def mac_address():
     if IS_MAC:
         iface = ''
@@ -375,7 +461,7 @@ def inventory():
         'ramGB': ram, 'diskGB': round(size / 1e9), 'diskFreePct': round(free / size * 100) if size else None,
         'ip': primary_ip(), 'mac': mac_address(), 'user': console_user(), 'lastBoot': iso(boot) if boot else None,
         'cpuPct': cpu_percent(), 'memPct': mem_pct, 'agentVersion': AGENT_VERSION,
-        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), 'fortiConnected': forti_connected(), **join_info(),
+        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), 'fortiConnected': forti_connected(), 'ggvpn': ggvpn(), **join_info(),
     }
 
 
@@ -725,6 +811,12 @@ def cycle(skip_scan=False):
                 changed = True
             except Exception as e:  # noqa: BLE001 - reported to the console
                 res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
+        elif t in ('ggvpnon', 'ggvpnoff'):
+            try:
+                res['output'] = ggvpn_connect(c.get('vpn')) if t == 'ggvpnon' else ggvpn_disconnect()
+                changed = True
+            except Exception as e:  # noqa: BLE001 - reported to the console
+                res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
         elif t in ('vpnjoin', 'vpnleave'):
             try:
                 res['output'] = join_tailscale(c.get('authKey')) if t == 'vpnjoin' else leave_tailscale()
@@ -921,6 +1013,8 @@ def main():
         return
     if a.command == 'uninstall':
         unschedule()
+        if not IS_MAC and os.path.exists(GGVPN_CONF):
+            ggvpn_disconnect()
         shutil.rmtree(HOME, ignore_errors=True)
         print('GGT Agent removed. Retire the device in the Device Manager to remove its record.')
         return
