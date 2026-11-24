@@ -35,6 +35,9 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # GitHub's hosted Macs are sometimes unavailable for hours, so a Mac run that fails or never starts
+    # still shows red on the PR but doesn't hold back a deploy that passed on Windows and Ubuntu.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
