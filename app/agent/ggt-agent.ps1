@@ -29,7 +29,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.2.0'
+$AgentVersion = '2.3.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -123,7 +123,7 @@ function Get-Inventory {
     memPct = [math]::Round(100 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100))
     agentVersion = $AgentVersion
     joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
-    ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected
+    ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected; ggvpn = Get-GoGreenVpn
   }
 }
 
@@ -195,6 +195,98 @@ function Leave-Tailscale {
   $r = Invoke-Process $exe @('logout') 120
   if ($r.exitCode -ne 0) { throw "tailscale logout failed: $($r.output)" }
   return 'Left the Tailscale network. Tailscale is still installed; uninstall it from Deployments if you no longer need it.'
+}
+
+# ---------------------------------------------------------------- Go-Green VPN (WireGuard)
+# The company's own VPN server in Azure. The PC makes its own WireGuard key, which never leaves it;
+# only the public key is reported, and the VPN server picks it up from the console within a minute.
+$GgVpnTunnel = 'GoGreenVPN'
+$GgVpnDir = Join-Path $AgentDir 'vpn'
+function Find-WireGuard { @("$env:ProgramFiles\WireGuard\wireguard.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+function Find-Wg { @("$env:ProgramFiles\WireGuard\wg.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+function Install-WireGuard {
+  if (Find-WireGuard) { return }
+  $arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'arm64' } 'x86' { 'x86' } default { 'amd64' } }
+  $base = 'https://download.wireguard.com/windows-client/'
+  try {
+    $index = (Invoke-WebRequest -Uri $base -UseBasicParsing -TimeoutSec 120).Content
+    $ver = [regex]::Matches($index, "wireguard-$arch-([0-9.]+)\.msi") | ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } | Select-Object -Last 1
+    if (-not $ver) { throw 'no installer listed' }
+    $msi = Join-Path $env:TEMP "wireguard-$arch-$ver.msi"
+    Invoke-WebRequest -Uri "$base/wireguard-$arch-$ver.msi" -OutFile $msi -UseBasicParsing -TimeoutSec 900
+  } catch { throw "Couldn't download WireGuard: $($_.Exception.Message)" }
+  $sig = Get-AuthenticodeSignature $msi
+  if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'WireGuard') { Remove-Item $msi -Force -ErrorAction SilentlyContinue; throw "The WireGuard installer isn't signed by WireGuard LLC ($($sig.Status)). Not installing it." }
+  $r = Invoke-Process 'msiexec.exe' @('/i', "`"$msi`"", '/qn', '/norestart', 'DO_NOT_LAUNCH=1') 900
+  Remove-Item $msi -Force -ErrorAction SilentlyContinue
+  if ($r.exitCode -ne 0 -and $r.exitCode -ne 3010) { throw "WireGuard setup failed with exit code $($r.exitCode)." }
+  for ($i = 0; $i -lt 30 -and -not (Find-WireGuard); $i++) { Start-Sleep 2 }
+  if (-not (Find-WireGuard)) { throw 'WireGuard was installed but wireguard.exe was not found.' }
+}
+function Lock-Folder($Path) {
+  # Only SYSTEM and Administrators can read the VPN key.
+  $acl = New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $sid), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+  }
+  Set-Acl -Path $Path -AclObject $acl
+}
+function Get-GgVpnPublicKey {
+  $keyFile = Join-Path $GgVpnDir 'private.key'
+  $wg = Find-Wg
+  if (-not $wg -or -not (Test-Path $keyFile)) { return $null }
+  $p = New-Object Diagnostics.Process
+  $p.StartInfo = New-Object Diagnostics.ProcessStartInfo -Property @{ FileName = $wg; Arguments = 'pubkey'; RedirectStandardInput = $true; RedirectStandardOutput = $true; UseShellExecute = $false; CreateNoWindow = $true }
+  $null = $p.Start(); $p.StandardInput.WriteLine((Get-Content $keyFile -Raw).Trim()); $p.StandardInput.Close()
+  $pub = $p.StandardOutput.ReadToEnd().Trim(); $p.WaitForExit()
+  if ($pub -match '^[A-Za-z0-9+/]{43}=$') { return $pub } else { return $null }
+}
+function Get-GoGreenVpn {
+  try {
+    $conf = Join-Path $GgVpnDir "$GgVpnTunnel.conf"
+    if (-not (Test-Path $conf)) { return $null }
+    $pub = Get-GgVpnPublicKey
+    if (-not $pub) { return $null }
+    $addr = if ((Get-Content $conf -Raw) -match '(?m)^Address\s*=\s*([0-9.]+)') { $Matches[1] } else { $null }
+    $svc = Get-Service "WireGuardTunnel`$$GgVpnTunnel" -ErrorAction SilentlyContinue
+    $age = $null
+    $wg = Find-Wg
+    if ($svc -and $svc.Status -eq 'Running' -and $wg) {
+      $hs = (& $wg show $GgVpnTunnel latest-handshakes 2>$null | Out-String).Trim()
+      if ($hs -match '\s(\d+)$' -and [int64]$Matches[1] -gt 0) { $age = [int64]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$Matches[1]) }
+    }
+    return @{ publicKey = $pub; address = $addr; up = [bool]($svc -and $svc.Status -eq 'Running'); handshakeAgeSec = $age }
+  } catch { return $null }
+}
+function Connect-GoGreenVpn($Vpn) {
+  if (-not $Vpn -or -not $Vpn.address -or -not $Vpn.serverPublicKey -or -not $Vpn.endpoint) { throw 'The console did not send the VPN settings. Check the Go-Green VPN setup on the VPN page.' }
+  Install-WireGuard
+  $wg = Find-Wg; $exe = Find-WireGuard
+  if (-not (Test-Path $GgVpnDir)) { New-Item -ItemType Directory -Path $GgVpnDir -Force | Out-Null }
+  Lock-Folder $GgVpnDir
+  $keyFile = Join-Path $GgVpnDir 'private.key'
+  if (-not (Test-Path $keyFile)) { Set-Content -Path $keyFile -Value ((& $wg genkey | Out-String).Trim()) -Encoding ASCII -NoNewline }
+  $priv = (Get-Content $keyFile -Raw).Trim()
+  $lines = @('[Interface]', "PrivateKey = $priv", "Address = $($Vpn.address)/32")
+  if (@($Vpn.dns).Count) { $lines += "DNS = $(@($Vpn.dns) -join ', ')" }
+  $lines += @('', '[Peer]', "PublicKey = $($Vpn.serverPublicKey)", "AllowedIPs = $(@($Vpn.routes) -join ', ')", "Endpoint = $($Vpn.endpoint)", 'PersistentKeepalive = 25')
+  $conf = Join-Path $GgVpnDir "$GgVpnTunnel.conf"
+  Set-Content -Path $conf -Value ($lines -join "`r`n") -Encoding ASCII
+  if (Get-Service "WireGuardTunnel`$$GgVpnTunnel" -ErrorAction SilentlyContinue) { $null = Invoke-Process $exe @('/uninstalltunnelservice', $GgVpnTunnel) 120; Start-Sleep 3 }
+  $r = Invoke-Process $exe @('/installtunnelservice', "`"$conf`"") 180
+  if ($r.exitCode -ne 0) { throw "Couldn't start the VPN tunnel: $($r.output)" }
+  for ($i = 0; $i -lt 15 -and -not ((Get-Service "WireGuardTunnel`$$GgVpnTunnel" -ErrorAction SilentlyContinue).Status -eq 'Running'); $i++) { Start-Sleep 2 }
+  return "Set up the Go-Green VPN as $($Vpn.address). It connects within about a minute, once the VPN server picks up this PC, and stays on all the time."
+}
+function Disconnect-GoGreenVpn {
+  $exe = Find-WireGuard
+  if ($exe -and (Get-Service "WireGuardTunnel`$$GgVpnTunnel" -ErrorAction SilentlyContinue)) {
+    $r = Invoke-Process $exe @('/uninstalltunnelservice', $GgVpnTunnel) 120
+    if ($r.exitCode -ne 0) { throw "Couldn't stop the VPN tunnel: $($r.output)" }
+  }
+  Remove-Item (Join-Path $GgVpnDir "$GgVpnTunnel.conf") -Force -ErrorAction SilentlyContinue
+  return 'Disconnected from the Go-Green VPN and removed the tunnel. WireGuard is still installed.'
 }
 
 function Get-Security {
@@ -479,6 +571,8 @@ function Invoke-Cycle {
         'remoteoff' { $res.output = Set-RemoteDesktop $false; $changed = $true }
         'vpnjoin' { $res.output = Join-Tailscale "$($c.authKey)"; $state.forceInventory = $true; $changed = $true }
         'vpnleave' { $res.output = Leave-Tailscale; $state.forceInventory = $true; $changed = $true }
+        'ggvpnon' { $res.output = Connect-GoGreenVpn $c.vpn; $changed = $true }
+        'ggvpnoff' { $res.output = Disconnect-GoGreenVpn; $changed = $true }
         default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
       }
     } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }
@@ -580,6 +674,7 @@ if ($Install) {
 if ($Uninstall) {
   Assert-Admin
   Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
+  try { $null = Disconnect-GoGreenVpn } catch { }
   Remove-Item -Path $AgentDir -Recurse -Force -ErrorAction SilentlyContinue
   Write-Host 'GGT Agent removed. Retire the device in the Device Manager to remove its record.'
   exit 0

@@ -67,7 +67,10 @@ const TEST_APP = {
 TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test App';
 
 (async () => {
-  const server = spawn(process.execPath, [path.join(ROOT, 'dev-server.js')], { env: { ...process.env, PORT: String(PORT) }, stdio: 'inherit' });
+  // The Go-Green VPN, pointed at a documentation address so the test tunnel never carries real traffic.
+  const vpnKey = require('crypto').generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
+  const vpnEnv = { GGVPN_SERVER_PUBKEY: vpnKey, GGVPN_ENDPOINT: '192.0.2.1:51820', GGVPN_DNS: 'none', GGVPN_ROUTES: '10.99.0.0/24' };
+  const server = spawn(process.execPath, [path.join(ROOT, 'dev-server.js')], { env: { ...process.env, ...vpnEnv, PORT: String(PORT) }, stdio: 'inherit' });
   try {
     for (let i = 0; i < 50; i++) { try { await fetch(BASE + '/api/health'); break; } catch { await new Promise(r => setTimeout(r, 200)); } }
     await api('GET', '/api/console/state'); // creates the built-in collections and scripts
@@ -119,6 +122,23 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
         assert.ok(['succeeded', 'failed'].includes(rc.status) && rc.output, 'Screen Sharing result reported');
         if (rc.status === 'succeeded') assert.equal(st.devices[0].remoteOn, type === 'remoteon');
       }
+    }
+
+    // Go-Green VPN: Windows and Linux set up a WireGuard tunnel with their own key; macOS uses an installer.
+    for (const type of ['ggvpnon', 'ggvpnoff']) {
+      const vr = await api('POST', '/api/console/commands', { type, deviceIds: [dev.id] });
+      if (MAC) { assert.equal(vr.commands[0].status, 'skipped', 'Macs use a downloaded installer'); break; }
+      agent(WIN ? '-Run' : 'run');
+      st = await api('GET', '/api/console/state');
+      const vc = st.commands.find(c => c.runId === vr.runId);
+      const g = st.devices[0].ggvpn;
+      console.log(`Go-Green VPN ${type}:`, vc.status, vc.output, JSON.stringify(g));
+      assert.equal(vc.status, 'succeeded', `${type} succeeded`);
+      if (type === 'ggvpnon') {
+        assert.match(g.reported?.publicKey || '', /^[A-Za-z0-9+/]{43}=$/, 'device reports its own public key');
+        assert.equal(g.reported.address, '10.99.0.100');
+        assert.equal(g.reported.up, true, 'tunnel is up');
+      } else assert.equal(g?.reported ?? null, null, 'tunnel removed');
     }
 
     // Uninstall through a deployment, too.
