@@ -189,7 +189,10 @@ function buildPolicy(doc, ctx, commands = [], now = Date.now()) {
       deployments.push({ ...base, action: d.action || 'Install', app: { id: a.id, name: a.name, version: a.version, detectName: a.detectName, ...(a[PLATFORM_KEY[doc.platform]] || {}) } });
     } else if (d.kind === 'os') {
       const ts = (ctx.taskSequences || []).find(x => x.id === d.targetId);
-      if (!ts || osNotMet(doc)) continue;
+      // OSD_ALLOW_SERVER=1 lets task sequences reach Windows Server too. Only the CI test sets it,
+      // because GitHub's Windows machines run Windows Server.
+      const why = osNotMet(doc);
+      if (!ts || (why && !(process.env.OSD_ALLOW_SERVER === '1' && doc.platform === 'Windows' && /server/i.test(doc.os || '') && verAtLeast(doc.agentVersion, OS_AGENT_MIN)))) continue;
       const steps = [];
       let broken = null;
       for (const st of ts.steps || []) {

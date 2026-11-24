@@ -295,6 +295,10 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
       const k = { ...H2, 'x-ggt-device-key': who.body.deviceKey };
       assert.ok(!(await call('GET', '/api/agent/policy', null, k, { deviceId: who.body.deviceId })).body.deployments.some(x => x.kind === 'os'), `no task sequences for ${label}`);
     }
+    process.env.OSD_ALLOW_SERVER = '1';
+    assert.ok((await call('GET', '/api/agent/policy', null, { ...H2, 'x-ggt-device-key': srv.body.deviceKey }, { deviceId: srv.body.deviceId })).body.deployments.some(x => x.kind === 'os'), 'OSD_ALLOW_SERVER lets the CI test run on Windows Server');
+    assert.ok(!(await call('GET', '/api/agent/policy', null, { ...H2, 'x-ggt-device-key': old.body.deviceKey }, { deviceId: old.body.deviceId })).body.deployments.some(x => x.kind === 'os'), 'but never old agents');
+    delete process.env.OSD_ALLOW_SERVER;
     assert.equal((await call('POST', '/api/agent/status', { deviceId: wid, deploymentId: 'dep-os', state: 'reqnotmet', errorCode: 'NOT_READY', message: 'Not ready: no TPM' }, wk)).status, 202);
     st = (await call('GET', '/api/console/state')).body;
     const dv = st.devices.find(d => d.id === wid);

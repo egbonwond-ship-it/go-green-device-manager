@@ -70,7 +70,8 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
   // The Go-Green VPN, pointed at a documentation address so the test tunnel never carries real traffic.
   const vpnKey = require('crypto').generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
   const vpnEnv = { GGVPN_SERVER_PUBKEY: vpnKey, GGVPN_ENDPOINT: '192.0.2.1:51820', GGVPN_DNS: 'none', GGVPN_ROUTES: '10.99.0.0/24' };
-  const server = spawn(process.execPath, [path.join(ROOT, 'dev-server.js')], { env: { ...process.env, ...vpnEnv, PORT: String(PORT) }, stdio: 'inherit' });
+  // GitHub's Windows machines run Windows Server, which task sequences normally skip.
+  const server = spawn(process.execPath, [path.join(ROOT, 'dev-server.js')], { env: { ...process.env, ...vpnEnv, OSD_ALLOW_SERVER: '1', PORT: String(PORT) }, stdio: 'inherit' });
   try {
     for (let i = 0; i < 50; i++) { try { await fetch(BASE + '/api/health'); break; } catch { await new Promise(r => setTimeout(r, 200)); } }
     await api('GET', '/api/console/state'); // creates the built-in collections and scripts
