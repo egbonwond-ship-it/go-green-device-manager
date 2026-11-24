@@ -29,7 +29,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.2.0'
+$AgentVersion = '2.3.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -123,7 +123,7 @@ function Get-Inventory {
     memPct = [math]::Round(100 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100))
     agentVersion = $AgentVersion
     joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
-    ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected
+    ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected; wireguard = Get-WireGuard
   }
 }
 
@@ -195,6 +195,49 @@ function Leave-Tailscale {
   $r = Invoke-Process $exe @('logout') 120
   if ($r.exitCode -ne 0) { throw "tailscale logout failed: $($r.output)" }
   return 'Left the Tailscale network. Tailscale is still installed; uninstall it from Deployments if you no longer need it.'
+}
+
+# GO-Green VPN (WireGuard to vpn.go-greentechnologies.com). The tunnel runs as the service WireGuardTunnel$GoGreenVPN.
+$WgExe = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
+function Get-WireGuard {
+  $svc = @(Get-Service 'WireGuardTunnel$*' -ErrorAction SilentlyContinue)
+  $installed = Test-Path $WgExe
+  if (-not $installed -and -not $svc.Count) { return $null }
+  $run = @($svc | Where-Object { $_.Status -eq 'Running' })
+  $addr = $null
+  try { $addr = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -like '10.99.0.*' })[0].IPAddress } catch { }
+  $pick = if ($run.Count) { $run[0] } elseif ($svc.Count) { $svc[0] } else { $null }
+  return @{ installed = $installed; active = [bool]$run.Count; address = $addr; tunnel = if ($pick) { $pick.Name -replace '^WireGuardTunnel\$', '' } else { $null } }
+}
+function Connect-GoGreenVpn([string]$Config) {
+  if ($Config -notmatch '\[Interface\]') { throw 'No VPN configuration was sent. Check the VPN server on the VPN page, then try again.' }
+  if (-not (Test-Path $WgExe)) {
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+    $msi = Join-Path $env:TEMP "wireguard-$arch.msi"
+    try { Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-$arch-1.1.1.msi" -OutFile $msi -UseBasicParsing -TimeoutSec 900 } catch { throw "Couldn't download WireGuard: $($_.Exception.Message)" }
+    $r = Invoke-Process 'msiexec.exe' @('/i', "`"$msi`"", '/qn', '/norestart', 'DO_NOT_LAUNCH=1') 900
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+    if ($r.exitCode -ne 0 -and $r.exitCode -ne 3010) { throw "WireGuard setup failed with exit code $($r.exitCode)." }
+    if (-not (Test-Path $WgExe)) { throw 'WireGuard was installed but wireguard.exe was not found.' }
+  }
+  $dir = Join-Path $env:ProgramData 'GoGreenVPN'
+  New-Item -ItemType Directory -Force $dir | Out-Null
+  & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+  $conf = Join-Path $dir 'GoGreenVPN.conf'
+  [IO.File]::WriteAllText($conf, ($Config -replace "`r?`n", "`r`n"))
+  if (Get-Service 'WireGuardTunnel$GoGreenVPN' -ErrorAction SilentlyContinue) { Invoke-Process $WgExe @('/uninstalltunnelservice', 'GoGreenVPN') 120 | Out-Null; Start-Sleep 3 }
+  $r = Invoke-Process $WgExe @('/installtunnelservice', "`"$conf`"") 120
+  if ($r.exitCode -ne 0) { throw "Couldn't start the VPN tunnel: $($r.output)" }
+  for ($i = 0; $i -lt 15 -and -not (Get-WireGuard).address; $i++) { Start-Sleep 2 }
+  $w = Get-WireGuard
+  return "Connected to the GO-Green VPN as $($w.address). It starts with Windows, before anyone signs in."
+}
+function Disconnect-GoGreenVpn {
+  if (-not (Get-Service 'WireGuardTunnel$GoGreenVPN' -ErrorAction SilentlyContinue)) { return 'The GO-Green VPN was not set up on this PC.' }
+  $r = Invoke-Process $WgExe @('/uninstalltunnelservice', 'GoGreenVPN') 120
+  if ($r.exitCode -ne 0) { throw "Couldn't remove the VPN tunnel: $($r.output)" }
+  Remove-Item (Join-Path $env:ProgramData 'GoGreenVPN\GoGreenVPN.conf') -Force -ErrorAction SilentlyContinue
+  return 'Disconnected from the GO-Green VPN and removed its key. WireGuard is still installed.'
 }
 
 function Get-Security {
@@ -479,6 +522,8 @@ function Invoke-Cycle {
         'remoteoff' { $res.output = Set-RemoteDesktop $false; $changed = $true }
         'vpnjoin' { $res.output = Join-Tailscale "$($c.authKey)"; $state.forceInventory = $true; $changed = $true }
         'vpnleave' { $res.output = Leave-Tailscale; $state.forceInventory = $true; $changed = $true }
+        'wgjoin' { $res.output = Connect-GoGreenVpn "$($c.wgConfig)"; $state.forceInventory = $true; $changed = $true }
+        'wgleave' { $res.output = Disconnect-GoGreenVpn; $state.forceInventory = $true; $changed = $true }
         default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
       }
     } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }
