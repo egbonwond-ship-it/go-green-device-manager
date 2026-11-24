@@ -37,6 +37,23 @@ module.exports = {
       ],
     },
   ],
+  // Library applications added once to every console (on first open, or the first time after an upgrade).
+  // Admins can edit or delete them; a deleted one isn't added again.
+  apps: [
+    {
+      id: 'app-ggvpn-client', name: 'Go-Green VPN client (WireGuard)', publisher: 'WireGuard LLC', version: 'Latest', category: 'VPN', builtIn: true,
+      detectName: 'WireGuard', platforms: ['Windows', 'macOS'],
+      notes: 'Installs the WireGuard app that the Go-Green VPN uses. Then connect Windows PCs with Connect VPN on the VPN page; on a Mac, open a Mac installer from the VPN page in the WireGuard app.',
+      windows: { wingetId: 'WireGuard.WireGuard' },
+      macos: {
+        // The Mac app is only on the App Store, which needs the signed-in user: open its page for them.
+        command: 'u=$(stat -f %Su /dev/console); if [ -z "$u" ] || [ "$u" = root ]; then echo "Nobody is signed in to this Mac, so the App Store can\'t open."; exit 1; fi; ' +
+          'launchctl asuser "$(id -u "$u")" sudo -u "$u" open "macappstore://apps.apple.com/app/id1451685025" && ' +
+          'echo "Opened WireGuard in the App Store for $u. It shows as installed once they click Get."',
+        uninstall: 'rm -rf /Applications/WireGuard.app',
+      },
+    },
+  ],
   scripts: [
     { id: 'disk', name: 'Get disk usage', lang: 'PowerShell', builtIn: true, body: 'Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystemLabel, @{n="FreeGB";e={[math]::Round($_.SizeRemaining/1GB,1)}}, @{n="SizeGB";e={[math]::Round($_.Size/1GB,1)}} | Format-Table -AutoSize | Out-String -Width 200' },
     { id: 'temp', name: 'Clear temp files', lang: 'PowerShell', builtIn: true, body: '$before = (Get-PSDrive C).Free\nRemove-Item "$env:WINDIR\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue\nGet-ChildItem C:\\Users -Directory | ForEach-Object { Remove-Item "$($_.FullName)\\AppData\\Local\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue }\n"Freed {0:N2} GB" -f (((Get-PSDrive C).Free - $before) / 1GB)' },

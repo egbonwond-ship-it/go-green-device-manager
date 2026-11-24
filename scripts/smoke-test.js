@@ -29,6 +29,15 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal(r.status, 200);
   assert.ok(r.body.collections.some(c => c.id === 'c-all') && r.body.baselines.length === 3 && r.body.scripts.length >= 5, 'built-in configuration created');
   assert.equal(r.body.devices.length, 0, 'no demo devices');
+  assert.ok(r.body.apps.some(a => a.id === 'app-ggvpn-client' && a.windows.wingetId === 'WireGuard.WireGuard' && a.macos.command), 'the VPN client is in the software library');
+  { // a console made before the VPN client existed gets it once; a deleted one stays deleted
+    const s0 = memoryStore(); useStore(s0);
+    await s0.putObject('settings', 'main', { id: 'main', approvedAdmins: [] });
+    assert.ok((await call('GET', '/api/console/state')).body.apps.some(a => a.id === 'app-ggvpn-client'), 'added to an existing console');
+    assert.equal((await call('DELETE', '/api/console/objects/app/app-ggvpn-client')).status, 200);
+    assert.ok(!(await call('GET', '/api/console/state')).body.apps.some(a => a.id === 'app-ggvpn-client'), 'not added again after deletion');
+    useStore(memoryStore()); r = await call('GET', '/api/console/state');
+  }
   console.log('✓ sign-in: anonymous 401, non-admin 403, ADMIN_USERS and admin role');
 
   // ---------- agent enrollment

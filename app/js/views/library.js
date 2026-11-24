@@ -37,7 +37,7 @@ function openApp(id) {
   const deps = S.state.deployments.filter(d => d.kind === 'app' && d.targetId === id);
   const dr = drawer(`<span class="dev-icon">⬚</span><div class="grow"><h2>${esc(a.name)}</h2><div class="muted small">${esc(a.publisher || '')} · version ${esc(a.version || '')}</div>
     <div class="actions-row"><a class="btn sm primary" href="#/deployments?new=1&app=${a.id}">Deploy</a><button class="btn sm" id="ed">Edit</button><button class="btn sm danger" id="rm">Delete</button></div></div>`,
-  `<div class="card stack"><div class="kv"><div><span>Category</span><b>${esc(a.category || '—')}</b></div><div><span>Platforms</span><b>${a.platforms.join(', ')}</b></div><div><span>Added</span><b>${a.created ? fmtDay(a.created) : '—'}</b></div>
+  `<div class="card stack">${a.notes ? `<p class="small muted">${esc(a.notes)}</p>` : ''}<div class="kv"><div><span>Category</span><b>${esc(a.category || '—')}</b></div><div><span>Platforms</span><b>${a.platforms.join(', ')}</b></div><div><span>Added</span><b>${a.created ? fmtDay(a.created) : '—'}</b></div>
       <div><span>Detection</span><b>Installed programs list contains “${esc(a.detectName)}”</b></div></div>
     ${PLATFORMS.filter(([p]) => a.platforms.includes(p)).map(([p, k]) => { const x = a[k] || {}; return `<h3>${p}</h3><div class="console">${[
       x.wingetId && `winget install --id ${x.wingetId} --silent`, x.package && `install package ${x.package}`, x.url && `download ${x.url}${x.sha256 ? `\nsha256 ${x.sha256}` : ''}${x.args ? `\nrun with: ${x.args}` : ''}`,
