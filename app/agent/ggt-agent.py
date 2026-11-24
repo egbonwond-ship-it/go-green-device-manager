@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.2.0'
+AGENT_VERSION = '2.3.0'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -259,6 +259,71 @@ def tailscale():
             'dnsName': (me.get('DNSName') or '').rstrip('.') or None, 'online': j.get('BackendState') == 'Running'}
 
 
+WG_LINUX_CONF = '/etc/wireguard/ggtvpn.conf'
+
+
+def wireguard():
+    """GO-Green VPN (WireGuard to vpn.go-greentechnologies.com): installed, connected, and the VPN address."""
+    if IS_MAC:
+        installed = os.path.exists('/Applications/WireGuard.app')
+        lines = [l for l in out(['scutil', '--nc', 'list']).splitlines() if 'com.wireguard.macos' in l]
+        if not installed and not lines:
+            return None
+        on = [l for l in lines if '(Connected)' in l]
+        name = re.search(r'"([^"]+)"', (on or lines or [''])[0])
+        addr = re.search(r'\binet (10\.99\.0\.\d+)', out(['ifconfig']))
+        return {'installed': installed, 'active': bool(on), 'address': addr.group(1) if addr and on else None, 'tunnel': name.group(1) if name else None}
+    if not shutil.which('wg') and not os.path.exists(WG_LINUX_CONF):
+        return None
+    m = re.search(r'\d+: (\S+)\s+inet (10\.99\.0\.\d+)', out(['ip', '-4', '-o', 'addr', 'show']))
+    return {'installed': bool(shutil.which('wg')), 'active': bool(m), 'address': m.group(2) if m else None, 'tunnel': m.group(1) if m else ('ggtvpn' if os.path.exists(WG_LINUX_CONF) else None)}
+
+
+def connect_wireguard(config):
+    """Connect to the GO-Green VPN with the config the console sent (Linux; Macs use the WireGuard app)."""
+    if IS_MAC:
+        raise RuntimeError('Macs use the WireGuard app from the App Store: make a config with "Config for a Mac or phone" on the VPN page and import it there.')
+    if not config or '[Interface]' not in config:
+        raise RuntimeError('No VPN configuration was sent. Check the VPN server on the VPN page, then try again.')
+    if not shutil.which('wg-quick'):
+        for pm, cmd in (('apt-get', 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools'),
+                        ('dnf', 'dnf install -y -q wireguard-tools'), ('yum', 'yum install -y -q wireguard-tools'), ('zypper', 'zypper -n -q install wireguard-tools')):
+            if shutil.which(pm):
+                code, text = sh(['/bin/sh', '-c', cmd], timeout=900)
+                if code != 0:
+                    raise RuntimeError('Installing WireGuard failed: %s' % text[-500:])
+                break
+        if not shutil.which('wg-quick'):
+            raise RuntimeError('WireGuard (wireguard-tools) is not installed and no supported package manager was found.')
+    # wg-quick needs resolvconf for DNS=; on systemd-resolved systems set the DNS on the tunnel instead.
+    m = re.search(r'^DNS = (.+)$', config, re.M)
+    if m and not shutil.which('resolvconf') and shutil.which('resolvectl'):
+        parts = [x.strip() for x in m.group(1).split(',')]
+        servers = ' '.join(x for x in parts if re.match(r'^\d+\.\d+\.\d+\.\d+$', x))
+        domains = ' '.join('~' + x for x in parts if not re.match(r'^\d+\.\d+\.\d+\.\d+$', x))
+        config = config.replace(m.group(0), 'PostUp = resolvectl dns %%i %s; resolvectl domain %%i %s' % (servers, domains))
+    os.makedirs('/etc/wireguard', exist_ok=True)
+    fd = os.open(WG_LINUX_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(config)
+    sh(['systemctl', 'stop', 'wg-quick@ggtvpn'], timeout=60)
+    code, text = sh(['systemctl', 'enable', '--now', 'wg-quick@ggtvpn'], timeout=120)
+    if code != 0:
+        raise RuntimeError('Starting the VPN failed: %s' % text[-500:])
+    w = wireguard() or {}
+    return 'Connected to the GO-Green VPN as %s. It starts at boot.' % (w.get('address') or '?')
+
+
+def disconnect_wireguard():
+    if IS_MAC:
+        return 'On a Mac, turn the tunnel off in the WireGuard app. Its key has been removed from the VPN server.'
+    if not os.path.exists(WG_LINUX_CONF):
+        return 'The GO-Green VPN was not set up on this device.'
+    sh(['systemctl', 'disable', '--now', 'wg-quick@ggtvpn'], timeout=120)
+    os.remove(WG_LINUX_CONF)
+    return 'Disconnected from the GO-Green VPN and removed its key.'
+
+
 def mac_address():
     if IS_MAC:
         iface = ''
@@ -375,7 +440,7 @@ def inventory():
         'ramGB': ram, 'diskGB': round(size / 1e9), 'diskFreePct': round(free / size * 100) if size else None,
         'ip': primary_ip(), 'mac': mac_address(), 'user': console_user(), 'lastBoot': iso(boot) if boot else None,
         'cpuPct': cpu_percent(), 'memPct': mem_pct, 'agentVersion': AGENT_VERSION,
-        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), 'fortiConnected': forti_connected(), **join_info(),
+        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), 'fortiConnected': forti_connected(), 'wireguard': wireguard(), **join_info(),
     }
 
 
@@ -723,6 +788,12 @@ def cycle(skip_scan=False):
             try:
                 res['output'] = set_screen_sharing(t == 'remoteon')
                 changed = True
+            except Exception as e:  # noqa: BLE001 - reported to the console
+                res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
+        elif t in ('wgjoin', 'wgleave'):
+            try:
+                res['output'] = connect_wireguard(c.get('wgConfig')) if t == 'wgjoin' else disconnect_wireguard()
+                state['forceInventory'] = changed = True
             except Exception as e:  # noqa: BLE001 - reported to the console
                 res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
         elif t in ('vpnjoin', 'vpnleave'):

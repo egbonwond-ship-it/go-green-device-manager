@@ -170,6 +170,44 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal(r.body.set, false, 'key removed');
   console.log('✓ VPN: Tailscale key private, join command, FortiClient status');
 
+  // ---------- GO-Green VPN (WireGuard): server sync, per-device keys never stored, Mac configs
+  process.env.VPN_SYNC_TOKEN = 'vpn-sync-test';
+  const crypto = require('crypto');
+  const srvKey = crypto.randomBytes(32).toString('base64');
+  const VH = { 'x-ggt-vpn-token': 'vpn-sync-test' };
+  assert.equal((await call('POST', '/api/console/commands', { type: 'wgjoin', deviceIds: [id] })).status, 409, 'needs the VPN server to have synced');
+  assert.equal((await call('POST', '/api/vpn/sync', { publicKey: srvKey }, {})).status, 401, 'sync needs the token');
+  const handPeer = { publicKey: crypto.randomBytes(32).toString('base64'), name: 'lab-gateway-mac', allowedIps: '10.99.0.2/32, 172.16.29.0/24', latestHandshake: Date.now() - 20000, rx: 5000, tx: 9000 };
+  const sync = () => call('POST', '/api/vpn/sync', { publicKey: srvKey, endpoint: 'vpn.go-greentechnologies.com:51820', allowedIps: '10.99.0.0/24, 172.16.29.0/24', dns: '172.16.29.10, 172.16.29.11, go-greentechnologies.com', peers: [handPeer] }, VH);
+  r = await sync();
+  assert.equal(r.status, 200); assert.deepEqual(r.body.peers, []);
+  r = await call('POST', '/api/console/commands', { type: 'wgjoin', deviceIds: [id] });
+  assert.equal(r.body.commands[0].status, 'queued');
+  r = await call('GET', '/api/agent/policy', null, KEY2, { deviceId: id });
+  const wj = r.body.commands.find(c => c.type === 'wgjoin');
+  assert.match(wj.wgConfig, /^\[Interface\]\nPrivateKey = [A-Za-z0-9+/]{43}=\nAddress = 10\.99\.0\.20\/32/, 'device gets a config with its own key and the first free address');
+  assert.ok(wj.wgConfig.includes(`PublicKey = ${srvKey}`) && wj.wgConfig.includes('Endpoint = vpn.go-greentechnologies.com:51820') && wj.wgConfig.includes('DNS = 172.16.29.10'));
+  const priv = /PrivateKey = (\S+)/.exec(wj.wgConfig)[1];
+  const derived = crypto.createPublicKey({ key: Buffer.concat([Buffer.from('302e020100300506032b656e04220420', 'hex'), Buffer.from(priv, 'base64')]), format: 'der', type: 'pkcs8' }).export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
+  r = await sync();
+  assert.equal(r.body.peers.length, 1); assert.equal(r.body.peers[0].ip, '10.99.0.20'); assert.equal(r.body.peers[0].publicKey, derived, 'server gets the matching public key');
+  r = await call('GET', '/api/console/state');
+  assert.ok(!JSON.stringify(r.body).includes(priv), 'private key is never stored or shown');
+  assert.ok(!JSON.stringify(r.body).includes(r.body.vpn.peers[0] && 'presharedKey'), 'PSKs are not sent to the console');
+  assert.equal(r.body.vpn.server.peers[0].name, 'lab-gateway-mac', 'hand-made server peers are listed');
+  assert.equal((await call('POST', '/api/console/vpn/config', { name: '' })).status, 400);
+  r = await call('POST', '/api/console/vpn/config', { name: 'GGT-MAC-02' });
+  assert.equal(r.status, 200); assert.equal(r.body.ip, '10.99.0.21'); assert.match(r.body.config, /PrivateKey = /);
+  await call('POST', '/api/agent/checkin', { ...report, deviceId: id, wireguard: { installed: true, active: true, address: '10.99.0.20', tunnel: 'GoGreenVPN' } }, KEY2);
+  assert.equal((await call('GET', '/api/console/state')).body.devices[0].wireguard.address, '10.99.0.20', 'VPN status reported');
+  r = await call('POST', '/api/console/commands', { type: 'wgleave', deviceIds: [id] });
+  assert.equal(r.body.commands[0].status, 'queued');
+  r = await sync();
+  assert.deepEqual(r.body.peers.map(p => p.name), ['GGT-MAC-02'], 'disconnecting removes the device key from the server');
+  assert.equal((await call('DELETE', '/api/console/vpn/peers/manual-ggt-mac-02')).status, 200);
+  assert.equal((await sync()).body.peers.length, 0);
+  console.log('✓ GO-Green VPN: server sync, per-device keys, Mac configs, disconnect');
+
   // ---------- console rule logic matches the server's
   const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));
   const sample = M.deviceView({ id: 'a', name: 'GGT-ABJ-DT004', platform: 'Windows', os: 'Windows 10 Pro 22H2', build: '19045', type: 'Desktop', tags: ['pilot'], ip: '10.20.1.1', lastSeen: new Date().toISOString() }, { sites: [{ name: 'Abuja', code: 'ABJ', subnets: '10.20.0.0/16' }], apps: [], settings: {} });

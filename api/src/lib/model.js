@@ -58,6 +58,7 @@ function deviceView(doc, ctx, now = Date.now()) {
     joinType: doc.joinType || null, domain: doc.domain || '', netbiosDomain: doc.netbiosDomain || '', fqdn: doc.fqdn || '',
     ips: Array.isArray(doc.ips) && doc.ips.length ? doc.ips : doc.ip ? [doc.ip] : [], publicIp: doc.publicIp || '', rdpPort: doc.rdpPort || null,
     tailscale: doc.tailscale || null,
+    wireguard: doc.wireguard || null,
     fortiConnected: doc.fortiConnected ?? null,
     lastBoot: ms(doc.lastBoot), cpuPct: doc.cpuPct ?? null, memPct: doc.memPct ?? null, agentVersion: doc.agentVersion || '',
     enrolled: ms(doc.enrolled), lastSeen, online: age < ONLINE_MS,
@@ -181,7 +182,7 @@ function buildPolicy(doc, ctx, commands = [], now = Date.now()) {
     pollIntervalSec: ctx.settings?.pollIntervalSec || 300,
     deployments, remediate,
     settings: { screenLockMin: 10 },
-    commands: commands.map(c => ({ id: c.id, type: c.type, lang: c.lang, body: c.body, name: c.name, ...(c.authKey ? { authKey: c.authKey } : {}) })),
+    commands: commands.map(c => ({ id: c.id, type: c.type, lang: c.lang, body: c.body, name: c.name, ...(c.authKey ? { authKey: c.authKey } : {}), ...(c.wgConfig ? { wgConfig: c.wgConfig } : {}) })),
   };
 }
 
