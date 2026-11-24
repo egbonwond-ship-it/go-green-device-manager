@@ -268,7 +268,11 @@ function Connect-GoGreenVpn($Vpn) {
   $keyFile = Join-Path $GgVpnDir 'private.key'
   if (-not (Test-Path $keyFile)) { Set-Content -Path $keyFile -Value ((& $wg genkey | Out-String).Trim()) -Encoding ASCII -NoNewline }
   $priv = (Get-Content $keyFile -Raw).Trim()
-  $pub = ("$priv" | & $wg pubkey | Out-String).Trim()
+  # Windows PowerShell adds a CRLF when piping to a program, which wg rejects, so feed the key file directly.
+  $pubOut = Join-Path $GgVpnDir 'pubkey.tmp'
+  Start-Process -FilePath $wg -ArgumentList 'pubkey' -RedirectStandardInput $keyFile -RedirectStandardOutput $pubOut -NoNewWindow -Wait
+  $pub = (Get-Content $pubOut -Raw).Trim()
+  Remove-Item $pubOut -Force -ErrorAction SilentlyContinue
   if ($pub -notmatch '^[A-Za-z0-9+/]{43}=$') { throw "Couldn't work out this PC's VPN public key." }
   Set-Content -Path (Join-Path $GgVpnDir 'public.key') -Value $pub -Encoding ASCII
   $lines = @('[Interface]', "PrivateKey = $priv", "Address = $($Vpn.address)/32")
