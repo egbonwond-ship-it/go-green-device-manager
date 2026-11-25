@@ -30,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.6.0'
+$AgentVersion = '2.6.1'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -188,7 +188,10 @@ function Join-Tailscale([string]$AuthKey) {
   }
   $r = Invoke-Process $exe @('up', "--authkey=$AuthKey", '--unattended', "--hostname=$($env:COMPUTERNAME.ToLower())") 180
   if ($r.exitCode -ne 0) { throw "tailscale up failed: $($r.output -replace [regex]::Escape($AuthKey), 'tskey-…')" }
-  $t = Get-Tailscale
+  # Only report success once Tailscale shows an address for this PC.
+  $t = $null
+  for ($i = 0; $i -lt 15; $i++) { $t = Get-Tailscale; if ($t -and @($t.ips).Count) { break }; Start-Sleep 2 }
+  if (-not $t -or -not @($t.ips).Count) { throw 'tailscale up finished but the PC has no Tailscale address. Check that the Tailscale service is running, then join again.' }
   return "Joined Tailscale as $($t.dnsName) ($(@($t.ips) -join ', '))."
 }
 function Leave-Tailscale {
