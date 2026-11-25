@@ -164,6 +164,22 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
       } else assert.equal(er.commands[0].status, 'skipped', 'LUKS is report-only');
     }
 
+    // Local update server: PCs in its collection get Windows Update pointed at it, and back again when
+    // it's removed. (Installing WSUS itself takes too long for CI and needs Microsoft Update.)
+    if (WIN) {
+      const url = 'http://wsus.example.invalid:8530';
+      await api('PUT', '/api/console/objects/updateServer/main', { doc: { id: 'main', deviceId: 'some-server', url, products: ['Windows 11'], classifications: ['Security Updates'], clientCollectionId: 'c-all' } });
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      console.log('Windows Update server:', st.devices[0].wuServer);
+      assert.equal(st.devices[0].wuServer, url, 'PC pointed at the local update server');
+      await api('DELETE', '/api/console/objects/updateServer/main');
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      assert.equal(st.devices[0].wuServer, null, 'setting removed again');
+      assert.equal(st.devices[0].wsus, null, 'not an update server');
+    }
+
     // Windows OS deployment: task sequences run step by step. This can't really upgrade the runner,
     // so it checks a readiness failure, a full run of the other steps, a PC already on the target
     // build, and an upgrade whose image can't be fetched.

@@ -78,6 +78,7 @@ function deviceView(doc, ctx, now = Date.now()) {
     depState: doc.depState || {},
     osReady: doc.osReady || null,
     encryption: doc.encryption || null,
+    wuServer: doc.wuServer || null, wsus: doc.wsus || null,
   };
   return v;
 }
@@ -228,13 +229,21 @@ function buildPolicy(doc, ctx, commands = [], now = Date.now()) {
       (!r.delayDays || (ms(u.released) || 0) <= now - r.delayDays * DAY)).map(u => u.id);
     if (ids.length) deployments.push({ id: r.id, name: r.name, kind: 'updates', action: 'Install', restart: r.restart || 'Suppress', retryAt: r.retryAt || 0, allowedNow: !r.respectMW || allowedNow('updates'), updateIds: ids });
   }
+  // The local update server: Windows PCs in its collection get Windows Update pointed at it.
+  // null tells the agent to undo the setting if it made it.
+  const us = (ctx.updateServers || [])[0];
+  let wsusClient = null;
+  if (us && us.clientCollectionId && doc.platform === 'Windows' && doc.id !== us.deviceId && colIds.has(us.clientCollectionId)) {
+    const srv = (ctx.serverDevice && ctx.serverDevice.id === us.deviceId) ? ctx.serverDevice : null;
+    wsusClient = us.url ? us.url.replace(/\/$/, '') : srv ? `http://${srv.fqdn || srv.name}:${us.port || 8530}` : null;
+  }
   const remediate = uniq((ctx.baselines || []).filter(b => b.remediate).flatMap(b => b.rules.filter(r => r.remediable && (!r.workstationOnly || isWorkstation(view))).map(r => r.id)));
   return {
     deviceId: doc.id, issued: new Date(now).toISOString(),
     pollIntervalSec: ctx.settings?.pollIntervalSec || 300,
-    deployments, remediate,
+    deployments, remediate, wsusClient,
     settings: { screenLockMin: 10 },
-    commands: commands.map(c => ({ id: c.id, type: c.type, lang: c.lang, body: c.body, name: c.name, ...(c.authKey ? { authKey: c.authKey } : {}), ...(c.vpn ? { vpn: c.vpn } : {}) })),
+    commands: commands.map(c => ({ id: c.id, type: c.type, lang: c.lang, body: c.body, name: c.name, ...(c.authKey ? { authKey: c.authKey } : {}), ...(c.vpn ? { vpn: c.vpn } : {}), ...(c.wsus ? { wsus: c.wsus } : {}), ...(c.updates ? { updates: c.updates } : {}) })),
   };
 }
 

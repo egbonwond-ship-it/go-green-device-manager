@@ -345,6 +345,52 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
     console.log('✓ disk encryption: status, on/off per platform, recovery keys saved, hidden and logged');
   }
 
+  // ---------- local update server (WSUS)
+  {
+    useStore(memoryStore());
+    await call('GET', '/api/console/state');
+    const H4 = { 'x-ggt-enroll-token': 'test-token' };
+    const enrol = async (name, extra = {}) => { const x = await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows 11 Pro 24H2', build: '26100', type: 'Laptop', security: {}, name, serial: name, ...extra }, H4); return { id: x.body.deviceId, h: { ...H4, 'x-ggt-device-key': x.body.deviceKey } }; };
+    const srv = await enrol('GGT-WSUS01', { os: 'Windows Server 2022 Standard', type: 'VM', fqdn: 'ggt-wsus01.go-greentechnologies.com' });
+    const pc = await enrol('GGT-PC01');
+    const put = doc => call('PUT', '/api/console/objects/updateServer/main', { doc: { id: 'main', ...doc } });
+    const good = { deviceId: srv.id, products: ['Windows 11'], classifications: ['Security Updates'], clientCollectionId: 'c-wks' };
+    assert.equal((await put({ ...good, products: ['Windows 95'] })).status, 400, 'products checked');
+    assert.equal((await put({ ...good, contentDir: '\\\\share\\x' })).status, 400, 'local folder only');
+    assert.equal((await call('PUT', '/api/console/objects/updateServer/other', { doc: { id: 'other', ...good } })).status, 400, 'one update server');
+    r = await put(good);
+    assert.equal(r.status, 200); assert.equal(r.body.doc.port, 8530); assert.equal(r.body.doc.contentDir, 'C:\\WSUS'); assert.equal(r.body.doc.syncTime, '02:00');
+    let pol = (await call('GET', '/api/agent/policy', null, pc.h, { deviceId: pc.id })).body;
+    assert.equal(pol.wsusClient, 'http://ggt-wsus01.go-greentechnologies.com:8530', 'workstations pointed at the server by its name');
+    pol = (await call('GET', '/api/agent/policy', null, srv.h, { deviceId: srv.id })).body;
+    assert.equal(pol.wsusClient, null, 'the server itself is left alone');
+    assert.equal((await call('POST', '/api/console/commands', { type: 'wsussetup', deviceIds: [pc.id] })).status, 400, 'server actions only go to the server');
+    r = await call('POST', '/api/console/commands', { type: 'wsussetup', deviceIds: [srv.id] });
+    assert.equal(r.body.commands[0].status, 'queued');
+    assert.equal((await call('POST', '/api/console/commands', { type: 'wsusapprove', deviceIds: [srv.id], updates: ['nope'] })).status, 400, 'update IDs checked');
+    const U = '0b8a1e4c-5f6d-4a3b-9c2d-1e0f9a8b7c6d';
+    await call('POST', '/api/console/commands', { type: 'wsusapprove', deviceIds: [srv.id], updates: [U] });
+    pol = (await call('GET', '/api/agent/policy', null, srv.h, { deviceId: srv.id })).body;
+    assert.equal(pol.commands.find(c => c.type === 'wsussetup').wsus.products[0], 'Windows 11', 'settings travel with the setup command');
+    assert.deepEqual(pol.commands.find(c => c.type === 'wsusapprove').updates, [U]);
+    // The server reports its state; the list of needed updates is kept between hourly reports.
+    const wsus = { installed: true, port: 8530, lastSync: new Date().toISOString(), lastSyncResult: 'Succeeded', syncing: false, computers: 3, updates: [{ id: U, kb: 'KB5046617', title: 'Cumulative update', classification: 'Security Updates', severity: 'Critical', needed: 3, installed: 1, approved: false }] };
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows Server 2022 Standard', type: 'VM', security: {}, name: 'GGT-WSUS01', deviceId: srv.id, wsus }, srv.h);
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows Server 2022 Standard', type: 'VM', security: {}, name: 'GGT-WSUS01', deviceId: srv.id, wsus: { ...wsus, updates: undefined, syncing: true } }, srv.h);
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows 11 Pro 24H2', type: 'Laptop', security: {}, name: 'GGT-PC01', deviceId: pc.id, wuServer: 'http://ggt-wsus01.go-greentechnologies.com:8530' }, pc.h);
+    let st = (await call('GET', '/api/console/state')).body;
+    const sv = st.devices.find(d => d.id === srv.id);
+    assert.equal(sv.wsus.syncing, true); assert.equal(sv.wsus.updates[0].kb, 'KB5046617', 'needed updates kept between reports');
+    assert.equal(st.devices.find(d => d.id === pc.id).wuServer, 'http://ggt-wsus01.go-greentechnologies.com:8530');
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows Server 2022 Standard', type: 'VM', security: {}, name: 'GGT-WSUS01', deviceId: srv.id }, srv.h);
+    st = (await call('GET', '/api/console/state')).body;
+    assert.equal(st.devices.find(d => d.id === srv.id).wsus.updates.length, 1, 'an older agent that sends nothing keeps the last report');
+    assert.equal((await call('DELETE', '/api/console/objects/collection/c-wks')).status, 409);
+    await put({ ...good, url: 'http://wsus.lab:8530' });
+    assert.equal((await call('GET', '/api/agent/policy', null, pc.h, { deviceId: pc.id })).body.wsusClient, 'http://wsus.lab:8530', 'address override');
+    console.log('✓ update server: settings checked, PCs pointed at it, server-only actions, status kept between reports');
+  }
+
   // ---------- storage outage
   useStore({ kind: 'broken', countDevices: async () => { throw new Error('down'); }, getDevice: async () => { throw new Error('down'); } });
   assert.equal((await call('GET', '/api/health', null, {})).status, 503);

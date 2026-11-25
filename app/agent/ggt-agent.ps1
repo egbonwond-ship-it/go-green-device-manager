@@ -30,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.5.0'
+$AgentVersion = '2.6.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -125,7 +125,7 @@ function Get-Inventory {
     agentVersion = $AgentVersion
     joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
     ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected; ggvpn = Get-GoGreenVpn
-    osReady = Get-OsReadiness; encryption = Get-Encryption
+    osReady = Get-OsReadiness; encryption = Get-Encryption; wuServer = Get-WuServer; wsus = Get-WsusInfo
   }
 }
 
@@ -397,6 +397,161 @@ function Disable-DiskEncryption {
   if ([int]$cs.ConversionStatus -eq 0) { return "BitLocker is already off for $env:SystemDrive." }
   Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName Decrypt) 'Starting decryption'
   return "BitLocker is decrypting $env:SystemDrive. The PC stays usable while it runs."
+}
+
+# ---------------------------------------------------------------- local update server (WSUS)
+# On the Windows Server chosen in the Device Manager, the agent installs and configures WSUS, which
+# synchronizes with Microsoft Update (its upstream), downloads approved updates and serves them to
+# PCs on the network. PCs in the chosen collection get Windows Update pointed at it.
+$WsusSetupKey = 'HKLM:\SOFTWARE\Microsoft\Update Services\Server\Setup'
+$script:WsusFull = $false
+function Get-WsusApi {
+  Import-Module UpdateServices -ErrorAction Stop
+  return Get-WsusServer -ErrorAction Stop
+}
+function Get-WsusInfo {
+  if (-not (Get-Service WsusService -ErrorAction SilentlyContinue)) { return $null }
+  $info = [ordered]@{ installed = $true; port = $null; lastSync = $null; lastSyncResult = $null; syncing = $null; nextSync = $null; freeGB = $null; contentDir = $null; computers = $null; error = $null }
+  try {
+    $setup = Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue
+    $info.port = if ($setup.PortNumber) { [int]$setup.PortNumber } else { 8530 }
+    $info.contentDir = "$($setup.ContentDir)"
+    if ($setup.ContentDir) {
+      $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$(([IO.Path]::GetPathRoot($setup.ContentDir)).TrimEnd('\'))'"
+      if ($d) { $info.freeGB = [math]::Round($d.FreeSpace / 1GB) }
+    }
+    $w = Get-WsusApi
+    $sub = $w.GetSubscription()
+    $last = $sub.GetLastSynchronizationInfo()
+    if ($last) { $info.lastSync = Iso $last.EndTime.ToLocalTime(); $info.lastSyncResult = "$($last.Result)" }
+    $info.syncing = ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing')
+    if ($sub.SynchronizeAutomatically) { $info.nextSync = Iso $sub.GetNextSynchronizationTime().ToLocalTime() }
+    $info.computers = [int]$w.GetStatus().ComputerTargetCount
+    if ($script:WsusFull) { $info.updates = @(Get-WsusNeeded $w) }
+  } catch { $info.error = $_.Exception.Message }
+  return $info
+}
+# The updates PCs reporting to this server still need, most-needed first.
+function Get-WsusNeeded($W) {
+  $us = New-Object Microsoft.UpdateServices.Administration.UpdateScope
+  $cs = New-Object Microsoft.UpdateServices.Administration.ComputerTargetScope
+  $sums = @($W.GetSummariesPerUpdate($us, $cs) | Where-Object { ($_.NotInstalledCount + $_.DownloadedCount + $_.FailedCount) -gt 0 } |
+    Sort-Object { $_.NotInstalledCount + $_.DownloadedCount + $_.FailedCount } -Descending | Select-Object -First 150)
+  foreach ($s in $sums) {
+    try {
+      $u = $W.GetUpdate((New-Object Microsoft.UpdateServices.Administration.UpdateRevisionId($s.UpdateId)))
+      $kb = if ($u.KnowledgebaseArticles.Count) { 'KB' + $u.KnowledgebaseArticles[0] } else { $null }
+      [ordered]@{ id = "$($s.UpdateId)"; kb = $kb; title = "$($u.Title)"; classification = "$($u.UpdateClassificationTitle)"; severity = $(if ("$($u.MsrcSeverity)" -in @('Critical', 'Important', 'Moderate', 'Low')) { "$($u.MsrcSeverity)" } else { $null })
+        released = Iso $u.CreationDate; needed = [int]($s.NotInstalledCount + $s.DownloadedCount + $s.FailedCount); installed = [int]$s.InstalledCount; approved = [bool]$u.IsApproved; declined = [bool]$u.IsDeclined }
+    } catch { }
+  }
+}
+function Install-WsusServer($Cfg) {
+  if (-not $Cfg) { throw 'No update server settings were sent. Save them on the Windows Update Manager page first.' }
+  if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) { throw 'WSUS runs on Windows Server only.' }
+  if (-not (Get-WindowsFeature UpdateServices).Installed) {
+    Write-Log 'Installing the WSUS role'
+    $r = Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
+    if (-not $r.Success) { throw "Installing the WSUS role failed: $($r.ExitCode)" }
+  }
+  $dir = "$($Cfg.contentDir)"
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  if (-not (Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue).ContentDir) {
+    Write-Log "Running WSUS post-install (updates kept in $dir)"
+    $p = Invoke-Process "$env:ProgramFiles\Update Services\Tools\wsusutil.exe" @('postinstall', "CONTENT_DIR=`"$dir`"") 3600
+    if ($p.exitCode -ne 0) { throw "WSUS post-install failed ($($p.exitCode)): $(("$($p.output)" -split "`n" | Select-Object -Last 3) -join ' ')" }
+  }
+  $w = Get-WsusApi
+  Set-WsusServerSynchronization -UpdateServer $w -SyncFromMU | Out-Null
+  $c = $w.GetConfiguration()
+  $c.AllUpdateLanguagesEnabled = $false
+  $c.SetEnabledUpdateLanguages([string[]]@($Cfg.languages))
+  $c.Save()
+  $sub = $w.GetSubscription()
+  # The first time, fetch the list of products and classifications from Microsoft before choosing.
+  if (-not @($w.GetUpdateCategories()).Count) {
+    Write-Log 'Getting the product list from Microsoft Update'
+    $sub.StartSynchronizationForCategoryOnly()
+    $until = (Get-Date).AddMinutes(45)
+    do { Start-Sleep -Seconds 20 } while ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing' -and (Get-Date) -lt $until)
+  }
+  $cats = New-Object Microsoft.UpdateServices.Administration.UpdateCategoryCollection
+  $found = @()
+  foreach ($p in $w.GetUpdateCategories()) { if (@($Cfg.products) -contains $p.Title) { [void]$cats.Add($p); $found += $p.Title } }
+  $sub.SetUpdateCategories($cats)
+  $cls = New-Object Microsoft.UpdateServices.Administration.UpdateClassificationCollection
+  foreach ($k in $w.GetUpdateClassifications()) { if (@($Cfg.classifications) -contains $k.Title) { [void]$cls.Add($k) } }
+  $sub.SetUpdateClassifications($cls)
+  # Sync once a day at the chosen local time (WSUS keeps the time in UTC).
+  $t = [TimeSpan]::Parse("$($Cfg.syncTime)") - [TimeZoneInfo]::Local.GetUtcOffset((Get-Date))
+  if ($t.TotalHours -lt 0) { $t = $t.Add([TimeSpan]::FromDays(1)) } elseif ($t.TotalHours -ge 24) { $t = $t.Subtract([TimeSpan]::FromDays(1)) }
+  $sub.SynchronizeAutomatically = $true
+  $sub.SynchronizeAutomaticallyTimeOfDay = $t
+  $sub.NumberOfSynchronizationsPerDay = 1
+  $sub.Save()
+  $port = [int]$Cfg.port; if (-not $port) { $port = 8530 }
+  if (-not (Get-NetFirewallRule -Name 'GGT-WSUS' -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -Name 'GGT-WSUS' -DisplayName 'Go-Green update server (WSUS)' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
+  }
+  $sub.StartSynchronization()
+  $script:State.wsusForce = $true
+  $missing = @(@($Cfg.products) | Where-Object { $found -notcontains $_ })
+  $note = if ($missing.Count) { " Microsoft Update has no product called: $($missing -join ', ')." } else { '' }
+  return "WSUS is set up on $env:COMPUTERNAME (port $port, updates kept in $dir) and is synchronizing with Microsoft Update. The first sync takes 30-90 minutes; then it syncs daily at $($Cfg.syncTime).$note"
+}
+function Start-WsusSync {
+  $sub = (Get-WsusApi).GetSubscription()
+  if ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing') { return 'A synchronization is already running.' }
+  $sub.StartSynchronization()
+  $script:State.wsusForce = $true
+  return 'Synchronizing with Microsoft Update. New updates show here when it finishes.'
+}
+# Approved updates are downloaded from Microsoft by the server, then installed by the PCs that need them.
+function Set-WsusApproval($Ids, [bool]$Approve) {
+  $w = Get-WsusApi
+  $all = $w.GetComputerTargetGroups() | Where-Object { $_.Name -eq 'All Computers' } | Select-Object -First 1
+  $n = 0; $errs = @()
+  foreach ($id in @($Ids)) {
+    try {
+      $u = $w.GetUpdate((New-Object Microsoft.UpdateServices.Administration.UpdateRevisionId([guid]$id)))
+      if ($Approve) {
+        if ($u.RequiresLicenseAgreementAcceptance) { $u.AcceptLicenseAgreement() }
+        [void]$u.Approve([Microsoft.UpdateServices.Administration.UpdateApprovalAction]::Install, $all)
+      } else { $u.Decline() }
+      $n++
+    } catch { $errs += "${id}: $($_.Exception.Message)" }
+  }
+  $script:State.wsusForce = $true
+  $msg = if ($Approve) { "Approved $n update(s). The server downloads them from Microsoft, then PCs install them at their next update check." } else { "Declined $n update(s)." }
+  if ($errs.Count) { throw "$msg Failed: $($errs -join '; ')" }
+  return $msg
+}
+
+# PCs: point Windows Update at the local server, or undo it when the Device Manager stops doing so.
+$WuKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+function Get-WuServer {
+  $p = Get-ItemProperty $WuKey -ErrorAction SilentlyContinue
+  $use = (Get-ItemProperty "$WuKey\AU" -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
+  if ($p.WUServer -and $use -eq 1) { return "$($p.WUServer)" }
+  return $null
+}
+function Set-WuClient([string]$Url, $State) {
+  if ($Url) {
+    if ((Get-WuServer) -eq $Url) { $State.wuSetByAgent = $true; return $null }
+    if (-not (Test-Path "$WuKey\AU")) { New-Item -Path "$WuKey\AU" -Force | Out-Null }
+    Set-ItemProperty $WuKey -Name WUServer -Value $Url
+    Set-ItemProperty $WuKey -Name WUStatusServer -Value $Url
+    New-ItemProperty "$WuKey\AU" -Name UseWUServer -Value 1 -PropertyType DWord -Force | Out-Null
+    $State.wuSetByAgent = $true
+    return "Windows Update now uses the local update server $Url"
+  }
+  if ($State.wuSetByAgent) {
+    Remove-ItemProperty $WuKey -Name WUServer, WUStatusServer -ErrorAction SilentlyContinue
+    Remove-ItemProperty "$WuKey\AU" -Name UseWUServer -ErrorAction SilentlyContinue
+    $State.wuSetByAgent = $false
+    return 'Windows Update uses Microsoft Update directly again'
+  }
+  return $null
 }
 
 # ---------------------------------------------------------------- remote desktop
@@ -798,6 +953,9 @@ function Invoke-Cycle {
   $script:Config = To-Hash (Read-Json $ConfigPath)
   if (-not $script:Config.server -or -not $script:Config.token) { throw "Not installed. Run: ggt-agent.ps1 -Install -Server https://<site> -Token <token>" }
   $state = To-Hash (Read-Json $StatePath)
+  $script:State = $state
+  # The update server reports the updates PCs need about once an hour, or right after a change.
+  $script:WsusFull = [bool]$state.wsusForce -or -not $state.wsusAt -or ((Now-Ms) - [int64]$state.wsusAt) -gt 3600000
   $deps = To-Hash $state.deps
   $now = Now-Ms
   $errors = @(); $events = @($state.pendingEvents | Where-Object { $_ })
@@ -815,6 +973,8 @@ function Invoke-Cycle {
     catch { $errors += "Windows Update scan failed: $($_.Exception.Message)" }
   }
   $r = Invoke-Checkin $inv $sec $(if ($sendSw) { $sw } else { $null }) $upd $events $errors
+  if ($script:WsusFull -and $inv.wsus) { $state.wsusAt = $now; $state.wsusForce = $false }
+  $script:WsusFull = $false
   if ($sendSw) { $state.softwareHash = $swHash; $state.softwareAt = $now; $state.forceInventory = $false }
   $state.pendingEvents = @()
   $newEvents = @()
@@ -844,11 +1004,17 @@ function Invoke-Cycle {
         'ggvpnoff' { $res.output = Disconnect-GoGreenVpn; $changed = $true }
         'encon' { $res.output = Enable-DiskEncryption; $changed = $true }
         'encoff' { $res.output = Disable-DiskEncryption; $changed = $true }
+        'wsussetup' { $res.output = Install-WsusServer $c.wsus; $changed = $true }
+        'wsussync' { $res.output = Start-WsusSync; $changed = $true }
+        'wsusapprove' { $res.output = Set-WsusApproval $c.updates $true; $changed = $true }
+        'wsusdecline' { $res.output = Set-WsusApproval $c.updates $false; $changed = $true }
         default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
       }
     } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }
     try { Invoke-Api 'POST' '/api/agent/result' @{ deviceId = $script:Config.deviceId; commandId = $c.id; status = $res.status; exitCode = $res.exitCode; output = "$($res.output)" } | Out-Null } catch { Write-Log $_.Exception.Message 'warn' }
   }
+
+  try { $wu = Set-WuClient "$($policy.wsusClient)" $state; if ($wu) { $newEvents += $wu; $changed = $true } } catch { $newEvents += "Couldn't set the update server: $($_.Exception.Message)" }
 
   if (@($policy.remediate).Count) {
     $rem = Invoke-Remediation @($policy.remediate) $policy.settings $sec
