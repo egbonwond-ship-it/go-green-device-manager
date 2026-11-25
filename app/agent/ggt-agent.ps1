@@ -426,8 +426,11 @@ function Get-WsusInfo {
     if ($last) { $info.lastSync = Iso $last.EndTime.ToLocalTime(); $info.lastSyncResult = "$($last.Result)" }
     $info.syncing = ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing')
     if ($sub.SynchronizeAutomatically) { $info.nextSync = Iso $sub.GetNextSynchronizationTime().ToLocalTime() }
-    $info.computers = [int]$w.GetStatus().ComputerTargetCount
-    if ($script:WsusFull) { $info.updates = @(Get-WsusNeeded $w) }
+    # While a sync runs, WSUS can be too busy to answer these within the timeout; that isn't a fault.
+    try {
+      $info.computers = [int]$w.GetStatus().ComputerTargetCount
+      if ($script:WsusFull) { $info.updates = @(Get-WsusNeeded $w) }
+    } catch { if (-not $info.syncing) { throw } }
   } catch { $info.error = $_.Exception.Message }
   return $info
 }

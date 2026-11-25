@@ -25,8 +25,8 @@ function stateOf() {
   if (!us) return ['Not set up', 'neutral'];
   if (pendingCmd()) return [`${pendingCmd().name}…`, 'warn'];
   if (!w?.installed) return ['Not installed yet', 'warn'];
-  if (w.error) return ['Problem', 'bad'];
   if (w.syncing) return ['Synchronizing', 'warn'];
+  if (w.error) return ['Problem', 'bad'];
   if (w.lastSyncResult && !/Succeeded/i.test(w.lastSyncResult)) return [`Last sync: ${w.lastSyncResult}`, 'bad'];
   return ['Ready', 'good'];
 }
