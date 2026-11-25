@@ -30,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.6.1'
+$AgentVersion = '2.6.2'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -186,7 +186,9 @@ function Join-Tailscale([string]$AuthKey) {
     for ($i = 0; $i -lt 30 -and -not ($exe = Find-Tailscale); $i++) { Start-Sleep 2 }
     if (-not $exe) { throw 'Tailscale was installed but tailscale.exe was not found.' }
   }
-  $r = Invoke-Process $exe @('up', "--authkey=$AuthKey", '--unattended', "--hostname=$($env:COMPUTERNAME.ToLower())") 180
+  # --accept-dns=false keeps the PC's own DNS. Tailscale's DNS would replace it, which breaks name
+  # resolution on domain controllers and domain-joined PCs. --reset makes a re-join apply cleanly.
+  $r = Invoke-Process $exe @('up', '--reset', "--authkey=$AuthKey", '--unattended', '--accept-dns=false', "--hostname=$($env:COMPUTERNAME.ToLower())") 180
   if ($r.exitCode -ne 0) { throw "tailscale up failed: $($r.output -replace [regex]::Escape($AuthKey), 'tskey-…')" }
   # Only report success once Tailscale shows an address for this PC.
   $t = $null
