@@ -1,4 +1,4 @@
-// Windows Update Manager: a local update server (WSUS) on one of your Windows Servers. It
+// Local update server (WSUS), shown as the "Local update server" tab of Software updates: a local update server (WSUS) on one of your Windows Servers. It
 // synchronizes with Microsoft Update (its upstream), downloads the updates you approve, and PCs in a
 // chosen collection get their updates from it instead of each downloading from the internet.
 import * as S from '../store.js';
@@ -17,6 +17,7 @@ const servers = () => S.state.devices.filter(d => d.platform === 'Windows' && /s
 const srv = () => { const us = S.updateServer(); return us ? S.device(us.deviceId) : null; };
 const serverUrl = us => us.url || (srv() ? `http://${srv().fqdn || srv().name}:${us.port || 8530}` : '');
 const pendingCmd = () => S.state.commands.find(c => c.type?.startsWith('wsus') && (c.status === 'queued' || c.status === 'sent'));
+const inFlight = id => { const c = S.state.commands.find(c => (c.type === 'wsusapprove' || c.type === 'wsusdecline') && (c.status === 'queued' || c.status === 'sent') && (c.updates || []).includes(id)); return c ? c.type : null; };
 const lastCmd = () => S.state.commands.find(c => c.type?.startsWith('wsus') && !['queued', 'sent'].includes(c.status));
 
 function stateOf() {
@@ -30,13 +31,13 @@ function stateOf() {
   return ['Ready', 'good'];
 }
 
-export default function wsus(el, { params }) {
-  let tab = params.tab || (S.updateServer() ? 'updates' : 'settings');
+export function serverPanel(el, params = {}) {
+  let tab = params.sub || (S.updateServer() ? 'updates' : 'settings');
   let sel = new Set();
-  const TABS = [['updates', 'Updates'], ['pcs', 'PCs'], ['settings', 'Settings']];
-  el.innerHTML = `<div class="page-head"><div><h1>Windows Update Manager</h1><p class="muted">A local update server (WSUS) on one of your Windows Servers. It connects to Microsoft Update, downloads the updates you approve once, and the PCs you choose install them from it over the local network.</p></div>
-    <div class="actions"><button class="btn" id="sync">Sync now</button><button class="btn primary" id="setup">Set up server</button></div></div>
-    <div class="stats" id="st"></div><div class="tabs">${TABS.map(([k, l]) => `<button data-tab="${k}" aria-selected="${k === tab}">${l}</button>`).join('')}</div><div id="body"></div>`;
+  const TABS = [['updates', 'Approve updates'], ['pcs', 'PCs using it'], ['settings', 'Server settings']];
+  el.innerHTML = `<div style="display:flex;margin-bottom:12px;align-items:flex-start;gap:8px 12px;flex-wrap:wrap"><p class="muted small" style="flex:1;min-width:240px;margin:0">Windows Update Manager: a WSUS server on one of your Windows Servers connects to Microsoft Update, downloads the updates you approve once, and the PCs you choose install them from it over the local network.</p>
+    <button class="btn" id="wsync">Sync now</button><button class="btn primary" id="wsetup">Set up server</button></div>
+    <div class="stats" id="wst"></div><div class="tabs" id="wtabs">${TABS.map(([k, l]) => `<button data-sub="${k}" aria-selected="${k === tab}">${l}</button>`).join('')}</div><div id="wbody"></div>`;
   let cur = null;
   const stats = () => {
     const us = S.updateServer(), d = srv(), w = d?.wsus;
@@ -45,45 +46,45 @@ export default function wsus(el, { params }) {
     const using = url ? S.state.devices.filter(x => x.wuServer && x.wuServer.toLowerCase() === url.toLowerCase()).length : 0;
     const needed = (w?.updates || []).filter(u => !u.approved && !u.declined).length;
     const r = lastCmd();
-    el.querySelector('#st').innerHTML = `
-      <div class="stat"><div class="stat-label">Update server</div><div class="stat-value" style="font-size:18px">${badge(label, tone)}</div><div class="stat-sub">${d ? `${esc(d.name)}${url ? ` · <span class="mono">${esc(url)}</span>` : ''}` : 'Pick a Windows Server in Settings'}</div></div>
+    el.querySelector('#wst').innerHTML = `
+      <div class="stat"><div class="stat-label">Update server</div><div class="stat-value" style="font-size:18px">${badge(label, tone)}</div><div class="stat-sub">${d ? `${esc(d.name)}${url ? ` · <span class="mono">${esc(url)}</span>` : ''}` : 'Pick a Windows Server in Server settings'}</div></div>
       <div class="stat"><div class="stat-label">Last sync with Microsoft</div><div class="stat-value" style="font-size:18px">${w?.lastSync ? ago(new Date(w.lastSync).getTime()) : '—'}</div><div class="stat-sub">${w?.lastSyncResult ? esc(w.lastSyncResult) : 'Not synced yet'}${w?.nextSync ? ` · next ${fmtDate(new Date(w.nextSync).getTime())}` : ''}</div></div>
       <div class="stat"><div class="stat-label">PCs using it</div><div class="stat-value">${fmtN(using)}</div><div class="stat-sub">${w?.computers != null ? `${fmtN(w.computers)} reporting to WSUS` : '&nbsp;'}</div></div>
       <div class="stat ${needed ? 'alert' : ''}"><div class="stat-label">Needed, not approved</div><div class="stat-value">${fmtN(needed)}</div><div class="stat-sub">${w?.freeGB != null ? `${fmtN(w.freeGB)} GB free for updates` : '&nbsp;'}</div></div>
       ${r?.status === 'failed' ? `<div class="notice wide" style="grid-column:1/-1;color:var(--bad)">${esc(r.name)} failed: ${esc(r.output)}</div>` : w?.error ? `<div class="notice wide" style="grid-column:1/-1">${esc(w.error)}</div>` : ''}`;
-    el.querySelector('#sync').disabled = !w?.installed || !!pendingCmd();
-    el.querySelector('#setup').disabled = !us || !!pendingCmd();
-    el.querySelector('#setup').textContent = w?.installed ? 'Apply settings' : 'Set up server';
+    el.querySelector('#wsync').disabled = !w?.installed || !!pendingCmd();
+    el.querySelector('#wsetup').disabled = !us || !!pendingCmd();
+    el.querySelector('#wsetup').textContent = w?.installed ? 'Apply settings' : 'Set up server';
   };
   const draw = () => {
-    const b = el.querySelector('#body');
+    const b = el.querySelector('#wbody');
     const us = S.updateServer(), w = srv()?.wsus;
     if (tab === 'updates') {
       cur = table(b, {
         rows: () => srv()?.wsus?.updates || [], search: u => `${u.kb} ${u.title} ${u.classification}`,
-        empty: !us ? 'Set up the update server on the Settings tab first.' : !w?.installed ? 'The server isn’t installed yet.' : w.updatesAt ? 'No PC reporting to the server needs an update.' : 'The server lists updates PCs need after its first sync, about hourly.',
-        tools: '<span class="spacer"></span><span class="small muted" id="selc"></span><button class="btn sm" id="dec" disabled>Decline</button><button class="btn sm primary" id="app" disabled>Approve and download</button>',
+        empty: !us ? 'Set up the update server on the Server settings tab first.' : !w?.installed ? 'The server isn’t installed yet.' : w.updatesAt ? 'No PC reporting to the server needs an update.' : 'The server lists updates PCs need after its first sync, about hourly.',
+        tools: '<span class="spacer"></span><span class="small muted" id="wselc"></span><button class="btn sm" id="wdec" disabled>Decline</button><button class="btn sm primary" id="wapp" disabled>Approve and download</button>',
         cols: [
-          { key: 'x', label: '', render: u => (u.approved || u.declined ? '' : `<input type="checkbox" data-u="${esc(u.id)}" ${sel.has(u.id) ? 'checked' : ''} aria-label="Select ${esc(u.kb || u.title)}">`), sort: u => sel.has(u.id) },
+          { key: 'x', label: '', render: u => (u.approved || u.declined || inFlight(u.id) ? '' : `<input type="checkbox" data-u="${esc(u.id)}" ${sel.has(u.id) ? 'checked' : ''} aria-label="Select ${esc(u.kb || u.title)}">`), sort: u => sel.has(u.id) },
           { key: 'kb', label: 'Update', render: u => `<b>${esc(u.kb || '')}</b> ${esc(u.title)}<div class="small muted">${esc(u.classification || '')}${u.released ? ` · ${fmtDate(new Date(u.released).getTime())}` : ''}</div>` },
           { key: 'severity', label: 'Severity', render: u => (u.severity ? badge(u.severity) : '<span class="muted">—</span>') },
           { key: 'needed', label: 'Needed by', num: true, render: u => fmtN(u.needed) },
           { key: 'installed', label: 'Installed on', num: true, render: u => fmtN(u.installed) },
-          { key: 'approved', label: 'Status', render: u => (u.declined ? badge('Declined', 'neutral') : u.approved ? badge('Approved', 'good') : badge('Not approved', 'warn')), sort: u => (u.declined ? 2 : u.approved ? 1 : 0) },
+          { key: 'approved', label: 'Status', render: u => (inFlight(u.id) ? badge(inFlight(u.id) === 'wsusapprove' ? 'Approving…' : 'Declining…', 'warn') : u.declined ? badge('Declined', 'neutral') : u.approved ? badge('Approved', 'good') : badge('Not approved', 'warn')), sort: u => (u.declined ? 2 : u.approved ? 1 : 0) },
         ],
       });
-      const selc = () => { b.querySelector('#selc').textContent = sel.size ? `${sel.size} selected` : ''; b.querySelector('#app').disabled = b.querySelector('#dec').disabled = !sel.size || !!pendingCmd(); };
+      const selc = () => { b.querySelector('#wselc').textContent = sel.size ? `${sel.size} selected` : ''; b.querySelector('#wapp').disabled = b.querySelector('#wdec').disabled = !sel.size || !!pendingCmd(); };
       b.onchange = e => { const id = e.target.dataset.u; if (id) { if (e.target.checked) sel.add(id); else sel.delete(id); selc(); } };
       b.onclick = e => {
-        if (e.target.id === 'app') act('wsusapprove');
-        if (e.target.id === 'dec') confirmBox('Decline updates?', `Decline ${sel.size} update${sel.size === 1 ? '' : 's'}? PCs won’t get them from this server.`, 'Decline', () => act('wsusdecline'), true);
+        if (e.target.id === 'wapp') act('wsusapprove');
+        if (e.target.id === 'wdec') confirmBox('Decline updates?', `Decline ${sel.size} update${sel.size === 1 ? '' : 's'}? PCs won’t get them from this server.`, 'Decline', () => act('wsusdecline'), true);
       };
       const act = type => S.wsusAction(type, [...sel]).then(() => { toast(type === 'wsusapprove' ? 'Approved. The server downloads them from Microsoft at its next check-in, then PCs install them.' : 'Declining at the server’s next check-in.'); sel = new Set(); cur.draw(); selc(); }).catch(() => {});
       selc();
     } else if (tab === 'pcs') {
       const col = us?.clientCollectionId ? S.byId('collections', us.clientCollectionId) : null;
       const url = us ? serverUrl(us) : '';
-      b.innerHTML = `<div class="notice info small" style="margin-bottom:12px">${col ? `Windows PCs in <a href="#/collections/${esc(col.id)}">${esc(col.name)}</a> get Windows Update pointed at <span class="mono">${esc(url)}</span> at their next check-in. PCs leaving the collection go back to Microsoft Update. A domain Group Policy for Windows Update wins over this.` : 'No collection is set, so PCs keep getting updates from Microsoft directly. Choose a collection on the Settings tab.'}</div><div id="tbl"></div>`;
+      b.innerHTML = `<div class="notice info small" style="margin-bottom:12px">${col ? `Windows PCs in <a href="#/collections/${esc(col.id)}">${esc(col.name)}</a> get Windows Update pointed at <span class="mono">${esc(url)}</span> at their next check-in. PCs leaving the collection go back to Microsoft Update. A domain Group Policy for Windows Update wins over this.` : 'No collection is set, so PCs keep getting updates from Microsoft directly. Choose a collection on the Server settings tab.'}</div><div id="tbl"></div>`;
       b.onchange = b.onclick = null;
       cur = table(b.querySelector('#tbl'), {
         rows: () => S.state.devices.filter(d => d.platform === 'Windows' && (d.wuServer || (col && S.inCollection(d, col)))), search: d => `${d.name} ${d.wuServer || ''}`,
@@ -121,13 +122,13 @@ export default function wsus(el, { params }) {
         clientCollectionId: v('col'), url: v('url') };
       if (!doc.deviceId) { toast('Install the agent on a Windows Server first, then pick it here.', true); return; }
       if (!doc.products.length || !doc.classifications.length) { toast('Pick at least one product and one classification.', true); return; }
-      const installed = srv()?.id === doc.deviceId && srv()?.wsus?.installed;
+      const installed = S.device(doc.deviceId)?.wsus?.installed;
       S.saveUpdateServer(doc).then(() => toast(installed ? 'Saved. Select “Apply settings” to send them to the server.' : 'Saved. Select “Set up server” to install WSUS on it.')).catch(() => {});
     });
   }
-  el.querySelector('.tabs').addEventListener('click', e => { const t = e.target.closest('[data-tab]'); if (!t) return; tab = t.dataset.tab; el.querySelectorAll('[data-tab]').forEach(x => x.setAttribute('aria-selected', x.dataset.tab === tab)); draw(); });
-  el.querySelector('#sync').addEventListener('click', () => S.wsusAction('wsussync').then(() => toast('The server starts synchronizing at its next check-in.')).catch(() => {}));
-  el.querySelector('#setup').addEventListener('click', () => {
+  el.querySelector('#wtabs').addEventListener('click', e => { const t = e.target.closest('[data-sub]'); if (!t) return; tab = t.dataset.sub; el.querySelectorAll('[data-sub]').forEach(x => x.setAttribute('aria-selected', x.dataset.sub === tab)); draw(); });
+  el.querySelector('#wsync').addEventListener('click', () => S.wsusAction('wsussync').then(() => toast('The server starts synchronizing at its next check-in.')).catch(() => {}));
+  el.querySelector('#wsetup').addEventListener('click', () => {
     const d = srv();
     const installed = d?.wsus?.installed;
     confirmBox(installed ? 'Apply settings to the update server?' : 'Set up the update server?', installed ? `Send the products, classifications and sync time to <b>${esc(d?.name)}</b> and start a sync.` : `Install the WSUS role on <b>${esc(d?.name)}</b>, connect it to Microsoft Update and start the first sync? This takes a while and uses disk space on the server.`, installed ? 'Apply' : 'Set up',
