@@ -30,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.6.0'
+$AgentVersion = '2.6.1'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -446,8 +446,14 @@ function Get-WsusNeeded($W) {
     } catch { }
   }
 }
+function Test-WsusPostInstall($Dir) {
+  $cur = "$((Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue).ContentDir)".TrimEnd('\')
+  try { $w = Get-WsusApi; [void]$w.GetConfiguration() } catch { Write-Log "WSUS not answering yet: $($_.Exception.Message)"; return $true }
+  if ($cur -and $cur -ne $Dir.TrimEnd('\') -and -not $w.GetSubscription().GetLastSynchronizationInfo()) { return $true }
+  return $false
+}
 function Install-WsusServer($Cfg) {
-  if (-not $Cfg) { throw 'No update server settings were sent. Save them on the Windows Update Manager page first.' }
+  if (-not $Cfg) { throw 'No update server settings were sent. Save them on Software updates, Local update server tab, first.' }
   if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) { throw 'WSUS runs on Windows Server only.' }
   if (-not (Get-WindowsFeature UpdateServices).Installed) {
     Write-Log 'Installing the WSUS role'
@@ -456,7 +462,9 @@ function Install-WsusServer($Cfg) {
   }
   $dir = "$($Cfg.contentDir)"
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-  if (-not (Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue).ContentDir) {
+  # Installing the role already writes a default ContentDir, so that value doesn't mean post-install ran.
+  # Run it when the WSUS service doesn't answer yet, or when it has never synced and keeps updates elsewhere.
+  if (Test-WsusPostInstall $dir) {
     Write-Log "Running WSUS post-install (updates kept in $dir)"
     $p = Invoke-Process "$env:ProgramFiles\Update Services\Tools\wsusutil.exe" @('postinstall', "CONTENT_DIR=`"$dir`"") 3600
     if ($p.exitCode -ne 0) { throw "WSUS post-install failed ($($p.exitCode)): $(("$($p.output)" -split "`n" | Select-Object -Last 3) -join ' ')" }
