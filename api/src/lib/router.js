@@ -534,6 +534,13 @@ async function createCommands(b, user) {
       if (!ups.length) return { status: 400, body: { error: 'updates: the update IDs to approve or decline' } };
       wsusCmd = { updates: ups };
     }
+    // One setup or sync at a time: a second one cancels the first sync and leaves WSUS without its product list.
+    if (b.type === 'wsussetup' || b.type === 'wsussync') {
+      const since = Date.now() - 2 * 3600e3;
+      const open = (await Promise.all(['queued', 'sent'].map(status => db.listObjects('command', { where: { deviceId: us.deviceId, status }, limit: 50 })))).flat()
+        .find(c => (c.type === 'wsussetup' || c.type === 'wsussync') && (c.created || 0) > since);
+      if (open) return { status: 409, body: { error: `“${open.name}” is still running on the update server. Wait for it to finish, then try again.` } };
+    }
   }
   let script = null;
   if (b.type === 'script') { script = str(b.scriptId, 64) ? await db.getObject('script', b.scriptId) : null; if (!script) return { status: 404, body: { error: 'Unknown script' } }; }

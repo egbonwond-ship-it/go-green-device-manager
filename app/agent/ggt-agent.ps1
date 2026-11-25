@@ -452,6 +452,10 @@ function Test-WsusPostInstall($Dir) {
   if ($cur -and $cur -ne $Dir.TrimEnd('\') -and -not $w.GetSubscription().GetLastSynchronizationInfo()) { return $true }
   return $false
 }
+function Wait-WsusSync($Sub, $Minutes) {
+  $until = (Get-Date).AddMinutes($Minutes)
+  while ("$($Sub.GetSynchronizationStatus())" -ne 'NotProcessing' -and (Get-Date) -lt $until) { Start-Sleep -Seconds 20 }
+}
 function Install-WsusServer($Cfg) {
   if (-not $Cfg) { throw 'No update server settings were sent. Save them on Software updates, Local update server tab, first.' }
   if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) { throw 'WSUS runs on Windows Server only.' }
@@ -476,16 +480,24 @@ function Install-WsusServer($Cfg) {
   $c.SetEnabledUpdateLanguages([string[]]@($Cfg.languages))
   $c.Save()
   $sub = $w.GetSubscription()
-  # The first time, fetch the list of products and classifications from Microsoft before choosing.
-  if (-not @($w.GetUpdateCategories()).Count) {
+  # Let a sync that is already running finish, then make sure Microsoft's product list is here before
+  # choosing products (fetch it with a category-only sync, trying again once if it was cancelled).
+  Wait-WsusSync $sub 45
+  $tries = 0
+  while ($tries -lt 2 -and -not @($w.GetUpdateCategories() | Where-Object { @($Cfg.products) -contains $_.Title }).Count) {
+    $tries++
     Write-Log 'Getting the product list from Microsoft Update'
     $sub.StartSynchronizationForCategoryOnly()
-    $until = (Get-Date).AddMinutes(45)
-    do { Start-Sleep -Seconds 20 } while ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing' -and (Get-Date) -lt $until)
+    Start-Sleep -Seconds 20
+    Wait-WsusSync $sub 45
   }
   $cats = New-Object Microsoft.UpdateServices.Administration.UpdateCategoryCollection
   $found = @()
   foreach ($p in $w.GetUpdateCategories()) { if (@($Cfg.products) -contains $p.Title) { [void]$cats.Add($p); $found += $p.Title } }
+  if (-not $found.Count) {
+    $last = $sub.GetLastSynchronizationInfo()
+    throw "Microsoft Update hasn't sent its product list yet (last sync: $(if ($last) { "$($last.Result)" } else { 'none' })). Check the server can reach Microsoft Update, then select Apply settings again."
+  }
   $sub.SetUpdateCategories($cats)
   $cls = New-Object Microsoft.UpdateServices.Administration.UpdateClassificationCollection
   foreach ($k in $w.GetUpdateClassifications()) { if (@($Cfg.classifications) -contains $k.Title) { [void]$cls.Add($k) } }
