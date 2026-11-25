@@ -312,6 +312,39 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
     console.log('✓ OS deployment: images, task sequences, checks, policy, agent version and Server excluded, readiness');
   }
 
+  // ---------- disk encryption: status, on/off commands, recovery keys
+  {
+    useStore(memoryStore());
+    await call('GET', '/api/console/state');
+    const H3 = { 'x-ggt-enroll-token': 'test-token' };
+    const base = { platform: 'Windows', os: 'Windows 11 Pro 24H2', build: '26100', type: 'Laptop', security: { encrypted: false } };
+    const enrol = async (name, extra = {}) => { const x = await call('POST', '/api/agent/checkin', { ...base, name, serial: name, ...extra }, H3); return { id: x.body.deviceId, h: { ...H3, 'x-ggt-device-key': x.body.deviceKey } }; };
+    const w = await enrol('GGT-ENC-W1', { encryption: { kind: 'BitLocker', status: 'encrypting', percent: 42, method: 'XTS-AES 256', protectors: ['TPM', 'Recovery password'], available: true, extra: 1 } });
+    const mac = await enrol('GGT-ENC-M1', { platform: 'macOS', os: 'macOS 15.1', encryption: { kind: 'FileVault', status: 'off', available: true } });
+    const lin = await enrol('GGT-ENC-L1', { platform: 'Linux', os: 'Ubuntu 24.04', encryption: { kind: 'LUKS', status: 'nonsense' } });
+    r = await call('POST', '/api/console/commands', { type: 'encon', deviceIds: [w.id, mac.id, lin.id] });
+    assert.deepEqual(r.body.commands.map(c => c.status), ['queued', 'queued', 'skipped'], 'turn on: Windows and Mac, not Linux');
+    r = await call('POST', '/api/console/commands', { type: 'encoff', deviceIds: [w.id, mac.id] });
+    assert.deepEqual(r.body.commands.map(c => c.status), ['queued', 'skipped'], 'turn off: Windows only');
+    assert.ok((await call('GET', '/api/agent/policy', null, w.h, { deviceId: w.id })).body.commands.some(c => c.type === 'encon'), 'command delivered');
+    const BL = '123456-234567-345678-456789-567890-678901-789012-890123';
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: w.id, keys: [{ kind: 'BitLocker', keyId: '{A}', password: 'not-a-key' }] }, w.h)).status, 400, 'recovery key format checked');
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: w.id, keys: [{ kind: 'BitLocker', keyId: '{A}', password: BL }] }, mac.h)).status, 403, 'a device can only save its own key');
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: w.id, keys: [{ kind: 'BitLocker', keyId: '{A}', volume: 'C:', password: BL }] }, w.h)).status, 202);
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: mac.id, keys: [{ kind: 'FileVault', keyId: 'fv1', password: 'ABCD-EFGH-IJKL-MNOP-QRST-UVWX' }] }, mac.h)).status, 202);
+    const st = (await call('GET', '/api/console/state')).body;
+    assert.ok(!JSON.stringify(st).includes(BL), 'recovery keys never appear in the console state');
+    assert.equal(st.recoveryKeys.filter(k => k.deviceId === w.id).length, 1, 'console knows a key is saved');
+    const dv = st.devices.find(d => d.id === w.id);
+    assert.deepEqual(dv.encryption, { kind: 'BitLocker', status: 'encrypting', percent: 42, method: 'XTS-AES 256', protectors: ['TPM', 'Recovery password'], available: true, note: null });
+    assert.equal(st.devices.find(d => d.id === lin.id).encryption.status, null, 'unknown status dropped');
+    assert.equal((await call('GET', `/api/console/devices/${w.id}/recovery-keys`, null, who('stranger'))).status, 403, 'non-admins cannot read keys');
+    r = await call('GET', `/api/console/devices/${w.id}/recovery-keys`);
+    assert.equal(r.body.keys[0].password, BL);
+    assert.ok((await call('GET', '/api/console/state')).body.log.some(l => /Viewed the recovery key of GGT-ENC-W1/.test(l.message) && l.by === 'admin-user'), 'viewing a key is logged');
+    console.log('✓ disk encryption: status, on/off per platform, recovery keys saved, hidden and logged');
+  }
+
   // ---------- storage outage
   useStore({ kind: 'broken', countDevices: async () => { throw new Error('down'); }, getDevice: async () => { throw new Error('down'); } });
   assert.equal((await call('GET', '/api/health', null, {})).status, 503);

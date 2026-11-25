@@ -124,11 +124,21 @@ function sanitizeReport(b) {
       tpm: /^\d+(\.\d+)?$/.test(String(b.osReady.tpm || '')) ? String(b.osReady.tpm) : null, secureBoot: bool(b.osReady.secureBoot), uefi: bool(b.osReady.uefi),
       arch: ['x64', 'arm64', 'x86'].includes(b.osReady.arch) ? b.osReady.arch : null, diskFreeGB: num(b.osReady.diskFreeGB, 0, 1e7),
     } : null,
+    encryption: cleanEncryption(b.encryption),
     security: {
       encrypted: bool(s.encrypted), avOn: bool(s.avOn), fwOn: bool(s.fwOn), defsAgeDays: num(s.defsAgeDays, 0, 10000),
       screenLockMin: num(s.screenLockMin, 0, 100000), usbBlocked: bool(s.usbBlocked), pendingReboot: bool(s.pendingReboot),
       localAdmins: arr(s.localAdmins, 100)?.map(a => cut(a, 120)) ?? null, remoteOn: bool(s.remoteOn),
     },
+  };
+}
+// Disk encryption of the system drive: BitLocker (Windows), FileVault (macOS) or LUKS (Linux).
+const ENC_STATUS = ['on', 'off', 'suspended', 'encrypting', 'decrypting', 'paused', 'pending'];
+function cleanEncryption(e) {
+  if (!e || typeof e !== 'object' || !['BitLocker', 'FileVault', 'LUKS'].includes(e.kind)) return null;
+  return {
+    kind: e.kind, status: ENC_STATUS.includes(e.status) ? e.status : null, percent: num(e.percent, 0, 100), method: cut(e.method, 40),
+    protectors: (arr(e.protectors, 10) || []).map(x => cut(x, 40)).filter(Boolean), available: bool(e.available), note: cut(e.note, 200),
   };
 }
 const cleanUpdate = u => ({
@@ -337,6 +347,28 @@ async function status(b, headers) {
   return { status: 202, body: { accepted: true } };
 }
 
+// ---------- recovery keys: agents save them here; admins can read them one device at a time (logged) ----------
+const KEY_FORMATS = { BitLocker: /^\d{6}(-\d{6}){7}$/, FileVault: /^[A-Z0-9]{4}(-[A-Z0-9]{4}){5}$/ };
+async function escrow(b, headers) {
+  const a = await deviceAuth(headers, b.deviceId);
+  if (a.error) return a.error;
+  const keys = (arr(b.keys, 10) || []).filter(k => k && KEY_FORMATS[k.kind]?.test(String(k.password || '')) && str(k.keyId, 80));
+  if (!keys.length) return { status: 400, body: { error: 'keys: [{kind, keyId, password}] with a BitLocker or FileVault recovery key is required' } };
+  const existing = await db.listObjects('recoveryKey', { where: { deviceId: a.doc.id } });
+  for (const k of keys) {
+    const id = `rk-${sha(`${a.doc.id}/${k.keyId}`).slice(0, 32)}`;
+    if (existing.some(x => x.id === id && x.password === k.password)) continue;
+    await db.putObject('recoveryKey', id, { id, deviceId: a.doc.id, deviceName: a.doc.name, kind: k.kind, keyId: cut(k.keyId, 80), volume: cut(k.volume, 20) || null, password: k.password, at: Date.now() });
+    await log('Disk encryption', `Saved the ${k.kind} recovery key of ${a.doc.name}`);
+  }
+  return { status: 202, body: { saved: keys.length } };
+}
+async function recoveryKeys(doc, user) {
+  const keys = await db.listObjects('recoveryKey', { where: { deviceId: doc.id } });
+  await log('Disk encryption', `Viewed the recovery key${keys.length === 1 ? '' : 's'} of ${doc.name}`, 'warn', user);
+  return { status: 200, body: { keys: keys.map(({ id, kind, keyId, volume, password, at }) => ({ id, kind, keyId, volume, password, at })) } };
+}
+
 async function commandResult(b, headers) {
   const a = await deviceAuth(headers, b.deviceId);
   if (a.error) return a.error;
@@ -386,6 +418,8 @@ async function consoleState(user, headers) {
       now: Date.now(), version: VERSION, storage: db.kind, user, viewerIp: clientIp(headers),
       enrollmentConfigured: Boolean(process.env.AGENT_ENROLL_TOKEN),
       tailscaleKey: await vpnKeyInfo(),
+      // Which devices have a recovery key saved; the keys themselves are fetched one device at a time.
+      recoveryKeys: (await db.listObjects('recoveryKey')).map(({ password, ...k }) => k),
       ggvpn: await vpnInfo(), vpnClients: await db.listObjects('vpnClient'),
       devices: docs.map(d => M.deviceView(d, ctx)), updates: M.updateCatalogue(docs),
       ...ctx, alerts, log: logs, commands, scriptRuns,
@@ -441,13 +475,13 @@ async function deleteObject(kind, id, query, user) {
 }
 
 const PLATFORMS_FOR = { PowerShell: ['Windows'], Shell: ['macOS', 'Linux'] };
-const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop', vpnjoin: 'Join Tailscale', vpnleave: 'Leave Tailscale', ggvpnon: 'Connect to the Go-Green VPN', ggvpnoff: 'Disconnect from the Go-Green VPN' };
+const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop', vpnjoin: 'Join Tailscale', vpnleave: 'Leave Tailscale', ggvpnon: 'Connect to the Go-Green VPN', ggvpnoff: 'Disconnect from the Go-Green VPN', encon: 'Turn on disk encryption', encoff: 'Turn off disk encryption' };
 const GGVPN_PLATFORMS = ['Windows', 'Linux'];
 const REMOTE_PLATFORMS = ['Windows', 'macOS'];
 async function createCommands(b, user) {
   const ids = arr(b.deviceIds, 2000) || [];
   if (!ids.length) return { status: 400, body: { error: 'deviceIds is required' } };
-  if (!['script', 'restart', 'inventory', 'updscan', 'remoteon', 'remoteoff', 'vpnjoin', 'vpnleave', 'ggvpnon', 'ggvpnoff'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory, updscan, remoteon, remoteoff, vpnjoin, vpnleave, ggvpnon or ggvpnoff' } };
+  if (!Object.keys(COMMAND_NAMES).concat('script').includes(b.type)) return { status: 400, body: { error: `type must be one of: script, ${Object.keys(COMMAND_NAMES).join(', ')}` } };
   if (b.type === 'ggvpnon' && !vpnConfig().configured) return { status: 409, body: { error: 'The Go-Green VPN server isn’t set up in the Device Manager yet (GGVPN_SERVER_PUBKEY in Azure).' } };
   if (b.type === 'vpnjoin' && !(await tailscaleKey())) return { status: 409, body: { error: 'Save a Tailscale auth key on the VPN page first' } };
   let script = null;
@@ -464,6 +498,8 @@ async function createCommands(b, user) {
     }
     if (b.type.startsWith('remote') && !REMOTE_PLATFORMS.includes(d.platform)) return { ...c, status: 'skipped', output: `Remote desktop is managed on Windows and macOS only, not ${d.platform}.` };
     if (b.type.startsWith('ggvpn') && !GGVPN_PLATFORMS.includes(d.platform)) return { ...c, status: 'skipped', output: 'On a Mac, download a Mac installer from the VPN page and open it in the WireGuard app.' };
+    if (b.type.startsWith('enc') && d.platform === 'Linux') return { ...c, status: 'skipped', output: 'Linux disk encryption (LUKS) is set up when Linux is installed; it can’t be turned on or off remotely.' };
+    if (b.type === 'encoff' && d.platform === 'macOS') return { ...c, status: 'skipped', output: 'Turning FileVault off needs the Mac user’s password: they turn it off in System Settings → Privacy & Security → FileVault.' };
     return c;
   });
   // The Go-Green VPN: give each connecting device its own address, and stop listing disconnected ones.
@@ -478,7 +514,7 @@ async function createCommands(b, user) {
   }
   await db.putMany('command', cmds);
   await db.putObject('scriptRun', runId, { id: runId, t: now, type: b.type, script: script ? script.name : COMMAND_NAMES[b.type], count: cmds.length, by: user });
-  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : b.type.startsWith('vpn') || b.type.startsWith('ggvpn') ? 'VPN' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
+  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : b.type.startsWith('vpn') || b.type.startsWith('ggvpn') ? 'VPN' : b.type.startsWith('enc') ? 'Disk encryption' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
   return { status: 200, body: { runId, commands: cmds.map(({ body, ...c }) => c) } };
 }
 
@@ -498,6 +534,7 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
     if (route === 'GET /api/agent/policy') return policy(query, headers);
     if (route === 'POST /api/agent/status') return status(body || {}, headers);
     if (route === 'POST /api/agent/result') return commandResult(body || {}, headers);
+    if (route === 'POST /api/agent/escrow') return escrow(body || {}, headers);
     return { status: 404, body: { error: 'Not found' } };
   }
 
@@ -522,7 +559,12 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
       await db.putMany('alert', pick.map(a => ({ ...a, ack: true, ackBy: user })));
       return { status: 200, body: { acknowledged: pick.length } };
     }
-    let m = /^\/api\/console\/devices\/([\w-]{1,64})$/.exec(path);
+    let m = /^\/api\/console\/devices\/([\w-]{1,64})\/recovery-keys$/.exec(path);
+    if (m && method === 'GET') {
+      const doc = await db.getDevice(m[1]);
+      return doc ? recoveryKeys(doc, user) : { status: 404, body: { error: 'Unknown device' } };
+    }
+    m = /^\/api\/console\/devices\/([\w-]{1,64})$/.exec(path);
     if (m) {
       const doc = await db.getDevice(m[1]);
       if (!doc) return { status: 404, body: { error: 'Unknown device' } };

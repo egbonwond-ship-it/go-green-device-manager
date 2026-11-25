@@ -77,6 +77,7 @@ function deviceView(doc, ctx, now = Date.now()) {
     updatesScannedAt: ms(doc.updates?.scannedAt),
     depState: doc.depState || {},
     osReady: doc.osReady || null,
+    encryption: doc.encryption || null,
   };
   return v;
 }

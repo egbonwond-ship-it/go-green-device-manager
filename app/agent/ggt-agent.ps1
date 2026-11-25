@@ -30,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.4.0'
+$AgentVersion = '2.5.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -125,7 +125,7 @@ function Get-Inventory {
     agentVersion = $AgentVersion
     joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
     ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected; ggvpn = Get-GoGreenVpn
-    osReady = Get-OsReadiness
+    osReady = Get-OsReadiness; encryption = Get-Encryption
   }
 }
 
@@ -329,6 +329,74 @@ function Get-Security {
   }
   $s.remoteOn = Get-RemoteOn
   return $s
+}
+
+# ---------------------------------------------------------------- disk encryption (BitLocker)
+$BlNs = 'root\cimv2\Security\MicrosoftVolumeEncryption'
+function Get-SystemVolume { Get-CimInstance -Namespace $BlNs -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction Stop }
+$BlMethods = @{ 0 = 'None'; 1 = 'AES 128 + Diffuser'; 2 = 'AES 256 + Diffuser'; 3 = 'AES 128'; 4 = 'AES 256'; 5 = 'Hardware'; 6 = 'XTS-AES 128'; 7 = 'XTS-AES 256' }
+$BlProtectors = @{ 1 = 'TPM'; 2 = 'Startup key'; 3 = 'Recovery password'; 4 = 'TPM and PIN'; 5 = 'TPM and startup key'; 6 = 'TPM, PIN and startup key'; 7 = 'Public key'; 8 = 'Passphrase'; 9 = 'TPM certificate'; 10 = 'Active Directory account' }
+function Get-BlProtectors($Volume) {
+  $ids = @((Invoke-CimMethod -InputObject $Volume -MethodName GetKeyProtectors -Arguments @{ KeyProtectorType = [uint32]0 }).VolumeKeyProtectorID)
+  foreach ($id in $ids) { if ($id) { @{ id = $id; type = [int](Invoke-CimMethod -InputObject $Volume -MethodName GetKeyProtectorType -Arguments @{ VolumeKeyProtectorID = $id }).KeyProtectorType } } }
+}
+function Get-Encryption {
+  $e = [ordered]@{ kind = 'BitLocker'; status = $null; percent = $null; method = $null; protectors = @(); available = $false; note = $null }
+  try { $v = Get-SystemVolume } catch { $v = $null }
+  if (-not $v) { $e.note = "BitLocker isn't available on this edition of Windows"; return $e }
+  $e.available = $true
+  try {
+    $cs = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus
+    $e.percent = [int]$cs.EncryptionPercentage
+    $e.status = switch ([int]$cs.ConversionStatus) {
+      0 { 'off' } 1 { if ([int]$v.ProtectionStatus -eq 1) { 'on' } else { 'suspended' } } 2 { 'encrypting' } 3 { 'decrypting' } default { 'paused' }
+    }
+    $m = [int](Invoke-CimMethod -InputObject $v -MethodName GetEncryptionMethod).EncryptionMethod
+    if ($m) { $e.method = $BlMethods[$m] }
+    $e.protectors = @(Get-BlProtectors $v | ForEach-Object { $BlProtectors[$_.type] } | Where-Object { $_ } | Select-Object -Unique)
+  } catch { $e.note = $_.Exception.Message }
+  return $e
+}
+# Sends the system drive's recovery password to the Device Manager. Only called when the agent turns
+# BitLocker on, so an admin can unlock the PC if it ever asks for its recovery key.
+function Send-RecoveryKeys {
+  $v = Get-SystemVolume
+  $keys = @(Get-BlProtectors $v | Where-Object { $_.type -eq 3 } | ForEach-Object {
+    $pw = (Invoke-CimMethod -InputObject $v -MethodName GetKeyProtectorNumericalPassword -Arguments @{ VolumeKeyProtectorID = $_.id }).NumericalPassword
+    if ($pw) { @{ kind = 'BitLocker'; keyId = "$($_.id)"; volume = $env:SystemDrive; password = "$pw" } } })
+  if (-not $keys.Count) { return $false }
+  try { Invoke-Api 'POST' '/api/agent/escrow' @{ deviceId = $script:Config.deviceId; keys = $keys } | Out-Null; return $true }
+  catch { Write-Log "Couldn't save the recovery key: $($_.Exception.Message)" 'warn'; return $false }
+}
+function Test-BlResult($r, [string]$What) {
+  if ([uint32]$r.ReturnValue -ne 0) { throw ("$What failed (0x{0:X8})" -f [uint32]$r.ReturnValue) }
+}
+function Enable-DiskEncryption {
+  try { $v = Get-SystemVolume } catch { $v = $null }
+  if (-not $v) { throw "BitLocker isn't available on this edition of Windows. Windows Home has Device Encryption instead, which Windows turns on itself when someone signs in with a Microsoft account." }
+  $cs = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus
+  if ([int]$cs.ConversionStatus -eq 1 -and [int]$v.ProtectionStatus -eq 1) { return "BitLocker is already on for $env:SystemDrive." }
+  if ([int]$cs.ConversionStatus -eq 1) {
+    Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName EnableKeyProtectors) 'Resuming BitLocker'
+    return "BitLocker protection resumed on $env:SystemDrive."
+  }
+  $tpm = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction SilentlyContinue
+  if (-not $tpm -or -not (Invoke-CimMethod -InputObject $tpm -MethodName IsReady).IsReady) { throw 'This PC has no TPM ready for BitLocker. Turn the TPM on in the firmware (BIOS/UEFI) settings, then try again.' }
+  $prot = @(Get-BlProtectors $v)
+  if (-not ($prot | Where-Object { @(1, 4, 5, 6) -contains $_.type })) { Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName ProtectKeyWithTPM -Arguments @{ FriendlyName = 'Go-Green Device Manager' }) 'Adding the TPM protector' }
+  if (-not ($prot | Where-Object { $_.type -eq 3 })) { Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName ProtectKeyWithNumericalPassword -Arguments @{ FriendlyName = 'Go-Green Device Manager' }) 'Adding a recovery password' }
+  # The recovery key must be safely saved before any data is encrypted.
+  if (-not (Send-RecoveryKeys)) { throw "Couldn't save the recovery key to the Device Manager, so encryption wasn't started. Try again." }
+  Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName Encrypt -Arguments @{ EncryptionMethod = [uint32]7; EncryptionFlags = [uint32]1 }) 'Starting encryption'
+  return "BitLocker is encrypting $env:SystemDrive (XTS-AES 256, used space only). The PC stays usable while it runs. The recovery key is saved in the Device Manager."
+}
+function Disable-DiskEncryption {
+  try { $v = Get-SystemVolume } catch { $v = $null }
+  if (-not $v) { return "BitLocker isn't available on this edition of Windows, so there's nothing to turn off." }
+  $cs = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus
+  if ([int]$cs.ConversionStatus -eq 0) { return "BitLocker is already off for $env:SystemDrive." }
+  Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName Decrypt) 'Starting decryption'
+  return "BitLocker is decrypting $env:SystemDrive. The PC stays usable while it runs."
 }
 
 # ---------------------------------------------------------------- remote desktop
@@ -774,6 +842,8 @@ function Invoke-Cycle {
         'vpnleave' { $res.output = Leave-Tailscale; $state.forceInventory = $true; $changed = $true }
         'ggvpnon' { $res.output = Connect-GoGreenVpn $c.vpn; $changed = $true }
         'ggvpnoff' { $res.output = Disconnect-GoGreenVpn; $changed = $true }
+        'encon' { $res.output = Enable-DiskEncryption; $changed = $true }
+        'encoff' { $res.output = Disable-DiskEncryption; $changed = $true }
         default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
       }
     } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }

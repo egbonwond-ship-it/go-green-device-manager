@@ -148,6 +148,22 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
     st = await api('GET', '/api/console/state');
     assert.ok(!st.devices[0].installed.includes('app-e2e'), 'test app removed');
 
+    // Disk encryption: every agent reports it. GitHub's Windows machines run Windows Server without the
+    // BitLocker feature, so turning it on must fail with a clear reason; Linux is report-only. (Not run
+    // on the Mac, where it would set up FileVault on the test machine.)
+    console.log('Disk encryption:', JSON.stringify(st.devices[0].encryption));
+    assert.equal(st.devices[0].encryption?.kind, WIN ? 'BitLocker' : MAC ? 'FileVault' : 'LUKS', 'encryption reported');
+    if (!MAC) {
+      const er = await api('POST', '/api/console/commands', { type: 'encon', deviceIds: [dev.id] });
+      if (WIN) {
+        agent('-Run');
+        st = await api('GET', '/api/console/state');
+        const ec = st.commands.find(c => c.runId === er.runId);
+        console.log('Turn on encryption:', ec.status, ec.output);
+        assert.ok(ec.status === 'succeeded' || /BitLocker|TPM/.test(ec.output), 'turning BitLocker on succeeds or explains why not');
+      } else assert.equal(er.commands[0].status, 'skipped', 'LUKS is report-only');
+    }
+
     // Windows OS deployment: task sequences run step by step. This can't really upgrade the runner,
     // so it checks a readiness failure, a full run of the other steps, a PC already on the target
     // build, and an upgrade whose image can't be fetched.

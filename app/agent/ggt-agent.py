@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.3.0'
+AGENT_VERSION = '2.5.0'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -461,7 +461,7 @@ def inventory():
         'ramGB': ram, 'diskGB': round(size / 1e9), 'diskFreePct': round(free / size * 100) if size else None,
         'ip': primary_ip(), 'mac': mac_address(), 'user': console_user(), 'lastBoot': iso(boot) if boot else None,
         'cpuPct': cpu_percent(), 'memPct': mem_pct, 'agentVersion': AGENT_VERSION,
-        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), 'fortiConnected': forti_connected(), 'ggvpn': ggvpn(), **join_info(),
+        'ips': all_ips(), 'rdpPort': 5900 if IS_MAC else None, 'tailscale': tailscale(), 'fortiConnected': forti_connected(), 'ggvpn': ggvpn(), 'encryption': encryption(), **join_info(),
     }
 
 
@@ -484,6 +484,76 @@ def group_members(*names):
     except ImportError:
         pass
     return sorted(members)
+
+
+# ---------------------------------------------------------------- disk encryption
+# FileVault (macOS) can be turned on from here: macOS asks the signed-in user for their password the
+# next time they log out, and the recovery key is then saved to the Device Manager. Turning it off
+# needs the user's password, so it's done in System Settings. Linux LUKS is reported only.
+FV_DEFER = '/var/db/ggt-filevault-defer.plist'
+
+
+def encryption():
+    if IS_MAC:
+        st = out(['fdesetup', 'status'])
+        e = {'kind': 'FileVault', 'status': None, 'percent': None, 'method': 'XTS-AES 128' if st else None, 'protectors': [], 'available': bool(st), 'note': None}
+        m = re.search(r'Percent completed = (\d+)', st)
+        if 'Deferred enablement appears to be active' in st:
+            e['status'], e['note'] = 'pending', 'Turns on when the user next logs out'
+        elif 'Encryption in progress' in st:
+            e['status'] = 'encrypting'
+        elif 'Decryption in progress' in st:
+            e['status'] = 'decrypting'
+        elif 'FileVault is On' in st:
+            e['status'] = 'on'
+        elif 'FileVault is Off' in st:
+            e['status'] = 'off'
+        if m:
+            e['percent'] = int(m.group(1))
+        users = out(['fdesetup', 'list'])
+        if users:
+            e['protectors'] = ['User passwords (%d)' % len(users.splitlines()), 'Personal recovery key'] if out(['fdesetup', 'haspersonalrecoverykey']) == 'true' else ['User passwords (%d)' % len(users.splitlines())]
+        return e
+    lsblk = out(['lsblk', '-rno', 'TYPE'])
+    return {'kind': 'LUKS', 'status': ('on' if 'crypt' in lsblk.split() else 'off') if lsblk else None, 'percent': None, 'method': None, 'protectors': [], 'available': False,
+            'note': 'Set up when Linux is installed'}
+
+
+def filevault_on():
+    if not IS_MAC:
+        raise RuntimeError('Disk encryption is turned on remotely on Windows and macOS only.')
+    st = out(['fdesetup', 'status'])
+    if 'FileVault is On' in st or 'Encryption in progress' in st:
+        return 'FileVault is already on.'
+    if 'Deferred enablement appears to be active' in st:
+        return 'FileVault is already waiting to turn on at the next logout.'
+    user = out(['stat', '-f', '%Su', '/dev/console'])
+    if not user or user == 'root':
+        raise RuntimeError('Nobody is signed in to this Mac. FileVault is turned on for the signed-in user, so try again when someone is using it.')
+    code, text = sh(['fdesetup', 'enable', '-user', user, '-defer', FV_DEFER, '-forceatlogin', '0'], timeout=60)
+    if code != 0:
+        raise RuntimeError('fdesetup failed (%s): %s' % (code, text.strip()[-300:]))
+    return ('FileVault turns on the next time %s logs out: macOS asks for their password, then encrypts in the background. '
+            'The recovery key is saved in the Device Manager after that.' % user)
+
+
+def send_filevault_key():
+    """After a deferred FileVault enablement that this agent set up, macOS writes the recovery key to FV_DEFER."""
+    if not IS_MAC or not os.path.exists(FV_DEFER):
+        return
+    try:
+        with open(FV_DEFER, 'rb') as f:
+            key = plistlib.load(f).get('RecoveryKey')
+    except Exception:  # noqa: BLE001 - not written yet
+        return
+    if not key:
+        return
+    try:
+        api('POST', '/api/agent/escrow', {'deviceId': CONFIG['deviceId'], 'keys': [{'kind': 'FileVault', 'keyId': 'filevault-' + hashlib.sha256(key.encode()).hexdigest()[:12], 'volume': '/', 'password': key}]})
+        os.remove(FV_DEFER)
+        log('Saved the FileVault recovery key to the Device Manager')
+    except ApiError as e:
+        log("Couldn't save the FileVault recovery key: %s" % e, 'warn')
 
 
 def security():
@@ -782,6 +852,7 @@ def cycle(skip_scan=False):
     if send_sw:
         state.update(softwareHash=sw_hash, softwareAt=now, forceInventory=False)
     state['pendingEvents'] = []
+    send_filevault_key()
     new_events = []
     policy = api('GET', '/api/agent/policy?deviceId=' + urllib.parse.quote(CONFIG['deviceId']))
     changed = False
@@ -814,6 +885,14 @@ def cycle(skip_scan=False):
         elif t in ('ggvpnon', 'ggvpnoff'):
             try:
                 res['output'] = ggvpn_connect(c.get('vpn')) if t == 'ggvpnon' else ggvpn_disconnect()
+                changed = True
+            except Exception as e:  # noqa: BLE001 - reported to the console
+                res = {'status': 'failed', 'exitCode': None, 'output': str(e)}
+        elif t in ('encon', 'encoff'):
+            try:
+                if t == 'encoff':
+                    raise RuntimeError('Turning FileVault off needs the user\'s password: they turn it off in System Settings.' if IS_MAC else 'Not supported on Linux.')
+                res['output'] = filevault_on()
                 changed = True
             except Exception as e:  # noqa: BLE001 - reported to the console
                 res = {'status': 'failed', 'exitCode': None, 'output': str(e)}

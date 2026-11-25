@@ -5,7 +5,7 @@ const DAY = 86400000;
 const POLL_MS = 30000;
 const listeners = new Set();
 export let state = null;
-export const DEFAULT_STATE = { devices: [], updates: [], apps: [], collections: [], deployments: [], updateGroups: [], adrs: [], baselines: [], maintenanceWindows: [], scripts: [], osImages: [], taskSequences: [], sites: [], alerts: [], log: [], commands: [], scriptRuns: [], settings: { approvedAdmins: [] } };
+export const DEFAULT_STATE = { devices: [], updates: [], apps: [], collections: [], deployments: [], updateGroups: [], adrs: [], baselines: [], maintenanceWindows: [], scripts: [], recoveryKeys: [], osImages: [], taskSequences: [], sites: [], alerts: [], log: [], commands: [], scriptRuns: [], settings: { approvedAdmins: [] } };
 
 // Error codes agents commonly report (Windows Installer, Windows Update and the agent itself).
 export const ERRORS = {
@@ -376,6 +376,7 @@ export function deviceAction(id, action) {
 export function devicesAction(ids, action) {
   return send('POST', '/api/console/commands', { type: action, deviceIds: ids }).then(r => { refresh(); return r; });
 }
+export const recoveryKeys = id => send('GET', `/api/console/devices/${encodeURIComponent(id)}/recovery-keys`);
 export function saveTailscaleKey(authKey) {
   return send('PUT', '/api/console/vpn/tailscale-key', { authKey }).then(r => { state.tailscaleKey = r; emit(); refresh(); return r; });
 }
