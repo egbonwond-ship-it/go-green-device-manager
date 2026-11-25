@@ -51,9 +51,13 @@ async function log(source, message, level = 'info', by = null) {
   const id = newId('log');
   await db.putObject('log', id, { id, t: Date.now(), source, message: cut(message, 500), level, by });
 }
+// One open alert per device and problem: if the same alert is still unacknowledged (for example
+// disk space dipping under the limit again), refresh it instead of adding a duplicate.
 async function alert(severity, title, detail, deviceId = null) {
-  const id = newId('al');
-  await db.putObject('alert', id, { id, t: Date.now(), severity, title: cut(title, 200), detail: cut(detail, 500), deviceId, ack: false });
+  title = cut(title, 200);
+  const open = deviceId ? (await db.listObjects('alert', { where: { deviceId, title }, limit: 20 })).find(a => !a.ack) : null;
+  const id = open ? open.id : newId('al');
+  await db.putObject('alert', id, { ...(open || {}), id, t: Date.now(), severity, title, detail: cut(detail, 500), deviceId, ack: false });
 }
 
 // Console configuration, cached briefly per API instance so agent check-ins stay cheap.

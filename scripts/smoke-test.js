@@ -237,6 +237,18 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal(r.body.commands.find(c => c.type === 'ggvpnon').vpn.address, '10.99.0.100', 'reconnecting keeps the same address');
   console.log('✓ Go-Green VPN: address pool, device keys, installers, peer sync, revoke');
 
+  // ---------- an alert that is still open isn't raised twice
+  {
+    const low = { ...report, deviceId: id, diskFreePct: 50 };
+    const count = async () => (await call('GET', '/api/console/state')).body.alerts.filter(a => !a.ack && /Low disk space/.test(a.title)).length;
+    await call('POST', '/api/agent/checkin', low, KEY2);
+    await call('POST', '/api/agent/checkin', { ...low, diskFreePct: 5 }, KEY2);
+    await call('POST', '/api/agent/checkin', low, KEY2);
+    await call('POST', '/api/agent/checkin', { ...low, diskFreePct: 4 }, KEY2);
+    assert.equal(await count(), 1, 'repeated low disk space keeps one open alert');
+    console.log('✓ alerts: no duplicates while one is open');
+  }
+
   // ---------- console rule logic matches the server's
   const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));
   const sample = M.deviceView({ id: 'a', name: 'GGT-ABJ-DT004', platform: 'Windows', os: 'Windows 10 Pro 22H2', build: '19045', type: 'Desktop', tags: ['pilot'], ip: '10.20.1.1', lastSeen: new Date().toISOString() }, { sites: [{ name: 'Abuja', code: 'ABJ', subnets: '10.20.0.0/16' }], apps: [], settings: {} });

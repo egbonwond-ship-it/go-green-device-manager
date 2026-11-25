@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.5.0'
+AGENT_VERSION = '2.5.1'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -229,8 +229,18 @@ def join_tailscale(key):
     code, text = sh([exe, 'up', '--authkey=' + key, '--hostname=' + socket.gethostname().split('.')[0].lower()], timeout=180)
     if code != 0:
         raise RuntimeError('tailscale up failed: %s' % text.replace(key, 'tskey-…')[-500:])
-    t = tailscale() or {}
-    return 'Joined Tailscale as %s (%s).' % (t.get('dnsName') or '?', ', '.join(t.get('ips') or []))
+    # Only report success once Tailscale shows an address for this device.
+    t = {}
+    for _ in range(15):
+        t = tailscale() or {}
+        if t.get('ips'):
+            break
+        time.sleep(2)
+    if not t.get('ips'):
+        raise RuntimeError('tailscale up finished but the device has no Tailscale address. '
+                           + ('On macOS install the standalone Tailscale app from pkgs.tailscale.com (the App Store version can\'t be managed by the agent), open it once, then join again.' if IS_MAC
+                              else 'Check that the tailscaled service is running, then join again.'))
+    return 'Joined Tailscale as %s (%s).' % (t.get('dnsName') or '?', ', '.join(t['ips']))
 
 
 def leave_tailscale():
