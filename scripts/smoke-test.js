@@ -367,6 +367,8 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
     assert.equal((await call('POST', '/api/console/commands', { type: 'wsussetup', deviceIds: [pc.id] })).status, 400, 'server actions only go to the server');
     r = await call('POST', '/api/console/commands', { type: 'wsussetup', deviceIds: [srv.id] });
     assert.equal(r.body.commands[0].status, 'queued');
+    assert.equal((await call('POST', '/api/console/commands', { type: 'wsussync', deviceIds: [srv.id] })).status, 409, 'no sync while setup is still running');
+    assert.equal((await call('POST', '/api/console/commands', { type: 'wsussetup', deviceIds: [srv.id] })).status, 409, 'no second setup while one is running');
     assert.equal((await call('POST', '/api/console/commands', { type: 'wsusapprove', deviceIds: [srv.id], updates: ['nope'] })).status, 400, 'update IDs checked');
     const U = '0b8a1e4c-5f6d-4a3b-9c2d-1e0f9a8b7c6d';
     await call('POST', '/api/console/commands', { type: 'wsusapprove', deviceIds: [srv.id], updates: [U] });

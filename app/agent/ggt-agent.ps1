@@ -30,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.6.0'
+$AgentVersion = '2.6.1'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -426,8 +426,11 @@ function Get-WsusInfo {
     if ($last) { $info.lastSync = Iso $last.EndTime.ToLocalTime(); $info.lastSyncResult = "$($last.Result)" }
     $info.syncing = ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing')
     if ($sub.SynchronizeAutomatically) { $info.nextSync = Iso $sub.GetNextSynchronizationTime().ToLocalTime() }
-    $info.computers = [int]$w.GetStatus().ComputerTargetCount
-    if ($script:WsusFull) { $info.updates = @(Get-WsusNeeded $w) }
+    # While a sync runs, WSUS can be too busy to answer these within the timeout; that isn't a fault.
+    try {
+      $info.computers = [int]$w.GetStatus().ComputerTargetCount
+      if ($script:WsusFull) { $info.updates = @(Get-WsusNeeded $w) }
+    } catch { if (-not $info.syncing) { throw } }
   } catch { $info.error = $_.Exception.Message }
   return $info
 }
@@ -446,8 +449,18 @@ function Get-WsusNeeded($W) {
     } catch { }
   }
 }
+function Test-WsusPostInstall($Dir) {
+  $cur = "$((Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue).ContentDir)".TrimEnd('\')
+  try { $w = Get-WsusApi; [void]$w.GetConfiguration() } catch { Write-Log "WSUS not answering yet: $($_.Exception.Message)"; return $true }
+  if ($cur -and $cur -ne $Dir.TrimEnd('\') -and -not $w.GetSubscription().GetLastSynchronizationInfo()) { return $true }
+  return $false
+}
+function Wait-WsusSync($Sub, $Minutes) {
+  $until = (Get-Date).AddMinutes($Minutes)
+  while ("$($Sub.GetSynchronizationStatus())" -ne 'NotProcessing' -and (Get-Date) -lt $until) { Start-Sleep -Seconds 20 }
+}
 function Install-WsusServer($Cfg) {
-  if (-not $Cfg) { throw 'No update server settings were sent. Save them on the Windows Update Manager page first.' }
+  if (-not $Cfg) { throw 'No update server settings were sent. Save them on Software updates, Local update server tab, first.' }
   if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) { throw 'WSUS runs on Windows Server only.' }
   if (-not (Get-WindowsFeature UpdateServices).Installed) {
     Write-Log 'Installing the WSUS role'
@@ -456,7 +469,9 @@ function Install-WsusServer($Cfg) {
   }
   $dir = "$($Cfg.contentDir)"
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-  if (-not (Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue).ContentDir) {
+  # Installing the role already writes a default ContentDir, so that value doesn't mean post-install ran.
+  # Run it when the WSUS service doesn't answer yet, or when it has never synced and keeps updates elsewhere.
+  if (Test-WsusPostInstall $dir) {
     Write-Log "Running WSUS post-install (updates kept in $dir)"
     $p = Invoke-Process "$env:ProgramFiles\Update Services\Tools\wsusutil.exe" @('postinstall', "CONTENT_DIR=`"$dir`"") 3600
     if ($p.exitCode -ne 0) { throw "WSUS post-install failed ($($p.exitCode)): $(("$($p.output)" -split "`n" | Select-Object -Last 3) -join ' ')" }
@@ -468,16 +483,24 @@ function Install-WsusServer($Cfg) {
   $c.SetEnabledUpdateLanguages([string[]]@($Cfg.languages))
   $c.Save()
   $sub = $w.GetSubscription()
-  # The first time, fetch the list of products and classifications from Microsoft before choosing.
-  if (-not @($w.GetUpdateCategories()).Count) {
+  # Let a sync that is already running finish, then make sure Microsoft's product list is here before
+  # choosing products (fetch it with a category-only sync, trying again once if it was cancelled).
+  Wait-WsusSync $sub 45
+  $tries = 0
+  while ($tries -lt 2 -and -not @($w.GetUpdateCategories() | Where-Object { @($Cfg.products) -contains $_.Title }).Count) {
+    $tries++
     Write-Log 'Getting the product list from Microsoft Update'
     $sub.StartSynchronizationForCategoryOnly()
-    $until = (Get-Date).AddMinutes(45)
-    do { Start-Sleep -Seconds 20 } while ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing' -and (Get-Date) -lt $until)
+    Start-Sleep -Seconds 20
+    Wait-WsusSync $sub 45
   }
   $cats = New-Object Microsoft.UpdateServices.Administration.UpdateCategoryCollection
   $found = @()
   foreach ($p in $w.GetUpdateCategories()) { if (@($Cfg.products) -contains $p.Title) { [void]$cats.Add($p); $found += $p.Title } }
+  if (-not $found.Count) {
+    $last = $sub.GetLastSynchronizationInfo()
+    throw "Microsoft Update hasn't sent its product list yet (last sync: $(if ($last) { "$($last.Result)" } else { 'none' })). Check the server can reach Microsoft Update, then select Apply settings again."
+  }
   $sub.SetUpdateCategories($cats)
   $cls = New-Object Microsoft.UpdateServices.Administration.UpdateClassificationCollection
   foreach ($k in $w.GetUpdateClassifications()) { if (@($Cfg.classifications) -contains $k.Title) { [void]$cls.Add($k) } }
