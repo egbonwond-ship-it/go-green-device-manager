@@ -10,7 +10,7 @@ const { createStore } = require('./storage');
 const M = require('./model');
 const DEFAULTS = require('./defaults');
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 let db = createStore();
 const useStore = s => { db = s; ctxCache = null; };
 
@@ -58,7 +58,7 @@ async function alert(severity, title, detail, deviceId = null) {
 
 // Console configuration, cached briefly per API instance so agent check-ins stay cheap.
 let ctxCache = null;
-const CTX_KINDS = { sites: 'site', apps: 'app', collections: 'collection', deployments: 'deployment', updateGroups: 'updateGroup', adrs: 'adr', baselines: 'baseline', maintenanceWindows: 'maintenanceWindow' };
+const CTX_KINDS = { sites: 'site', apps: 'app', collections: 'collection', deployments: 'deployment', updateGroups: 'updateGroup', adrs: 'adr', baselines: 'baseline', maintenanceWindows: 'maintenanceWindow', scripts: 'script', osImages: 'osImage', taskSequences: 'taskSequence', updateServers: 'updateServer' };
 async function loadCtx(fresh = false) {
   if (!fresh && ctxCache && Date.now() - ctxCache.at < 30000) return ctxCache.ctx;
   const ctx = {};
@@ -74,21 +74,23 @@ async function ensureDefaults() {
   await db.putMany('collection', DEFAULTS.collections);
   await db.putMany('baseline', DEFAULTS.baselines);
   await db.putMany('script', DEFAULTS.scripts);
-  await db.putMany('app', DEFAULTS.apps.map(a => ({ ...a, created: Date.now() })));
-  await db.putObject('settings', 'main', { ...DEFAULTS.settings, seededApps: DEFAULTS.apps.map(a => a.id) });
-  await log('Setup', 'Created the built-in collections, compliance baselines, scripts and library applications');
+  for (const [kind, list] of BUILT_INS) await db.putMany(kind, DEFAULTS[list].map(a => ({ ...a, created: Date.now() })));
+  await db.putObject('settings', 'main', { ...DEFAULTS.settings, seededApps: BUILT_INS.flatMap(([, list]) => DEFAULTS[list].map(a => a.id)) });
+  await log('Setup', 'Created the built-in collections, compliance baselines, scripts, library applications, Windows images and task sequences');
   return true;
 }
 
-// Adds built-in library applications that this console hasn't had yet, once each.
+// Built-in library applications, Windows images and task sequences that this console hasn't had yet
+// are added once each; one an admin deleted isn't added again.
+const BUILT_INS = [['app', 'apps'], ['osImage', 'osImages'], ['taskSequence', 'taskSequences']];
 async function ensureBuiltInApps(settings) {
   const seeded = Array.isArray(settings.seededApps) ? settings.seededApps : [];
-  const todo = DEFAULTS.apps.filter(a => !seeded.includes(a.id));
+  const todo = BUILT_INS.flatMap(([kind, list]) => DEFAULTS[list].filter(a => !seeded.includes(a.id)).map(a => [kind, a]));
   if (!todo.length) return;
-  for (const a of todo) if (!(await db.getObject('app', a.id))) await db.putObject('app', a.id, { ...a, created: Date.now() });
-  await db.putObject('settings', 'main', { ...settings, seededApps: [...seeded, ...todo.map(a => a.id)] });
+  for (const [kind, a] of todo) if (!(await db.getObject(kind, a.id))) await db.putObject(kind, a.id, { ...a, created: Date.now() });
+  await db.putObject('settings', 'main', { ...settings, seededApps: [...seeded, ...todo.map(([, a]) => a.id)] });
   ctxCache = null;
-  await log('Setup', `Added ${todo.map(a => a.name).join(', ')} to the software library`);
+  await log('Setup', `Added ${todo.map(([, a]) => a.name).join(', ')}`);
 }
 
 // ---------- sign-in (Azure Static Web Apps puts the signed-in user in x-ms-client-principal) ----------
@@ -117,11 +119,44 @@ function sanitizeReport(b) {
     tailscale: b.tailscale && typeof b.tailscale === 'object' ? { ips: ipList(b.tailscale.ips), dnsName: host(b.tailscale.dnsName), online: bool(b.tailscale.online) } : null,
     ggvpn: b.ggvpn && typeof b.ggvpn === 'object' && WG_KEY.test(b.ggvpn.publicKey || '')
       ? { publicKey: b.ggvpn.publicKey, address: net.isIPv4(b.ggvpn.address || '') ? b.ggvpn.address : null, up: bool(b.ggvpn.up), handshakeAgeSec: num(b.ggvpn.handshakeAgeSec, 0, 1e9) } : null,
+    // Windows 11 hardware requirements the agent can check.
+    osReady: b.osReady && typeof b.osReady === 'object' ? {
+      tpm: /^\d+(\.\d+)?$/.test(String(b.osReady.tpm || '')) ? String(b.osReady.tpm) : null, secureBoot: bool(b.osReady.secureBoot), uefi: bool(b.osReady.uefi),
+      arch: ['x64', 'arm64', 'x86'].includes(b.osReady.arch) ? b.osReady.arch : null, diskFreeGB: num(b.osReady.diskFreeGB, 0, 1e7),
+    } : null,
+    encryption: cleanEncryption(b.encryption),
+    wuServer: cut(b.wuServer, 200),
+    wsus: 'wsus' in b ? cleanWsus(b.wsus) : undefined,
     security: {
       encrypted: bool(s.encrypted), avOn: bool(s.avOn), fwOn: bool(s.fwOn), defsAgeDays: num(s.defsAgeDays, 0, 10000),
       screenLockMin: num(s.screenLockMin, 0, 100000), usbBlocked: bool(s.usbBlocked), pendingReboot: bool(s.pendingReboot),
       localAdmins: arr(s.localAdmins, 100)?.map(a => cut(a, 120)) ?? null, remoteOn: bool(s.remoteOn),
     },
+  };
+}
+// The local update server (WSUS) as its agent reports it. The list of updates PCs need is sent
+// about hourly; check-ins in between keep the last list.
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function cleanWsus(w) {
+  if (!w || typeof w !== 'object') return null;
+  return {
+    installed: !!w.installed, port: num(w.port, 1, 65535), lastSync: date(w.lastSync), lastSyncResult: cut(w.lastSyncResult, 60), syncing: bool(w.syncing),
+    nextSync: date(w.nextSync), freeGB: num(w.freeGB, 0, 1e7), contentDir: cut(w.contentDir, 200), computers: num(w.computers, 0, 1e6), error: cut(w.error, 300),
+    updates: Array.isArray(w.updates) ? w.updates.slice(0, 200).filter(u => u && GUID.test(u.id || '')).map(u => ({
+      id: u.id, kb: cut(u.kb, 40), title: cut(u.title, 300), classification: cut(u.classification, 60), severity: SEVERITIES.includes(u.severity) ? u.severity : null,
+      released: date(u.released), needed: num(u.needed, 0, 1e6), installed: num(u.installed, 0, 1e6), approved: !!u.approved, declined: !!u.declined,
+    })) : null,
+    updatesAt: Array.isArray(w.updates) ? new Date().toISOString() : null,
+  };
+}
+
+// Disk encryption of the system drive: BitLocker (Windows), FileVault (macOS) or LUKS (Linux).
+const ENC_STATUS = ['on', 'off', 'suspended', 'encrypting', 'decrypting', 'paused', 'pending'];
+function cleanEncryption(e) {
+  if (!e || typeof e !== 'object' || !['BitLocker', 'FileVault', 'LUKS'].includes(e.kind)) return null;
+  return {
+    kind: e.kind, status: ENC_STATUS.includes(e.status) ? e.status : null, percent: num(e.percent, 0, 100), method: cut(e.method, 40),
+    protectors: (arr(e.protectors, 10) || []).map(x => cut(x, 40)).filter(Boolean), available: bool(e.available), note: cut(e.note, 200),
   };
 }
 const cleanUpdate = u => ({
@@ -173,6 +208,8 @@ async function checkin(b, headers) {
     agentErrors: (arr(b.errors, 20) || []).map(e => cut(e, 300)),
     publicIp: clientIp(headers),
   };
+  if (r.wsus === undefined) doc.wsus = prev?.wsus ?? null;
+  else if (r.wsus && r.wsus.updates === null && prev?.wsus?.updates) { doc.wsus.updates = prev.wsus.updates; doc.wsus.updatesAt = prev.wsus.updatesAt; }
   if (Array.isArray(b.software)) { doc.software = b.software.slice(0, 3000).map(s => ({ name: cut(s?.name, 200), version: cut(s?.version, 60), publisher: cut(s?.publisher, 100) })).filter(s => s.name); doc.softwareAt = now; }
   if (b.updates) doc.updates = { scannedAt: date(b.updates.scannedAt) || now, missing: (b.updates.missing || []).slice(0, 500).filter(u => u && str(u.id, 80)).map(cleanUpdate), installed: (b.updates.installed || []).slice(0, 1000).filter(u => u && str(u.id, 80)).map(cleanUpdate) };
   await db.upsertDevice(doc);
@@ -309,7 +346,9 @@ async function policy(query, headers) {
   const key = queued.some(c => c.type === 'vpnjoin') ? await tailscaleKey() : null;
   const vc = vpnConfig();
   const vpn = { address: a.doc.ggvpnAddr, serverPublicKey: vc.serverPublicKey, endpoint: vc.endpoint, dns: vc.dns, routes: vc.routes };
-  return { status: 200, body: M.buildPolicy(a.doc, ctx, queued.map(c => (c.type === 'vpnjoin' ? { ...c, authKey: key } : c.type === 'ggvpnon' ? { ...c, vpn } : c))) };
+  const us = (ctx.updateServers || [])[0] || null;
+  const serverDevice = us?.clientCollectionId && !us.url ? await db.getDevice(us.deviceId) : null;
+  return { status: 200, body: M.buildPolicy(a.doc, { ...ctx, serverDevice }, queued.map(c => (c.type === 'vpnjoin' ? { ...c, authKey: key } : c.type === 'ggvpnon' ? { ...c, vpn } : c.type === 'wsussetup' ? { ...c, wsus: us } : c))) };
 }
 
 async function status(b, headers) {
@@ -330,6 +369,28 @@ async function status(b, headers) {
   return { status: 202, body: { accepted: true } };
 }
 
+// ---------- recovery keys: agents save them here; admins can read them one device at a time (logged) ----------
+const KEY_FORMATS = { BitLocker: /^\d{6}(-\d{6}){7}$/, FileVault: /^[A-Z0-9]{4}(-[A-Z0-9]{4}){5}$/ };
+async function escrow(b, headers) {
+  const a = await deviceAuth(headers, b.deviceId);
+  if (a.error) return a.error;
+  const keys = (arr(b.keys, 10) || []).filter(k => k && KEY_FORMATS[k.kind]?.test(String(k.password || '')) && str(k.keyId, 80));
+  if (!keys.length) return { status: 400, body: { error: 'keys: [{kind, keyId, password}] with a BitLocker or FileVault recovery key is required' } };
+  const existing = await db.listObjects('recoveryKey', { where: { deviceId: a.doc.id } });
+  for (const k of keys) {
+    const id = `rk-${sha(`${a.doc.id}/${k.keyId}`).slice(0, 32)}`;
+    if (existing.some(x => x.id === id && x.password === k.password)) continue;
+    await db.putObject('recoveryKey', id, { id, deviceId: a.doc.id, deviceName: a.doc.name, kind: k.kind, keyId: cut(k.keyId, 80), volume: cut(k.volume, 20) || null, password: k.password, at: Date.now() });
+    await log('Disk encryption', `Saved the ${k.kind} recovery key of ${a.doc.name}`);
+  }
+  return { status: 202, body: { saved: keys.length } };
+}
+async function recoveryKeys(doc, user) {
+  const keys = await db.listObjects('recoveryKey', { where: { deviceId: doc.id } });
+  await log('Disk encryption', `Viewed the recovery key${keys.length === 1 ? '' : 's'} of ${doc.name}`, 'warn', user);
+  return { status: 200, body: { keys: keys.map(({ id, kind, keyId, volume, password, at }) => ({ id, kind, keyId, volume, password, at })) } };
+}
+
 async function commandResult(b, headers) {
   const a = await deviceAuth(headers, b.deviceId);
   if (a.error) return a.error;
@@ -340,14 +401,53 @@ async function commandResult(b, headers) {
 }
 
 // ---------- console ----------
-const EDITABLE = ['collection', 'app', 'deployment', 'updateGroup', 'adr', 'baseline', 'maintenanceWindow', 'script', 'site', 'settings'];
+const EDITABLE = ['collection', 'app', 'deployment', 'updateGroup', 'adr', 'baseline', 'maintenanceWindow', 'script', 'site', 'settings', 'osImage', 'taskSequence', 'updateServer'];
+const WSUS_PRODUCTS = ['Windows 11', 'Windows 10, version 1903 and later', 'Microsoft Server operating system-21H2', 'Microsoft Server Operating System-24H2', 'Microsoft Defender Antivirus', 'Microsoft 365 Apps/Office 2019/Office LTSC', 'Microsoft Edge'];
+const WSUS_CLASSES = ['Critical Updates', 'Security Updates', 'Definition Updates', 'Updates', 'Update Rollups', 'Feature Packs', 'Service Packs', 'Upgrades', 'Drivers', 'Tools'];
+function checkUpdateServer(doc) {
+  if (!str(doc.deviceId, 64)) return 'Pick the server that runs the update service';
+  doc.port = Number(doc.port) || 8530;
+  if (!(doc.port >= 1 && doc.port <= 65535)) return 'port must be 1-65535';
+  doc.contentDir = String(doc.contentDir || 'C:\\WSUS').trim();
+  if (!/^[A-Za-z]:\\[\w .\\-]{0,200}$/.test(doc.contentDir)) return 'The update folder must be a local path like C:\\WSUS';
+  if (!Array.isArray(doc.products) || !doc.products.length || doc.products.some(p => !WSUS_PRODUCTS.includes(p))) return `Pick products from: ${WSUS_PRODUCTS.join('; ')}`;
+  if (!Array.isArray(doc.classifications) || !doc.classifications.length || doc.classifications.some(c => !WSUS_CLASSES.includes(c))) return `Pick classifications from: ${WSUS_CLASSES.join(', ')}`;
+  doc.languages = (Array.isArray(doc.languages) && doc.languages.length ? doc.languages : ['en']).filter(l => /^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(l)).slice(0, 10);
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(doc.syncTime || '')) doc.syncTime = '02:00';
+  if (doc.url && !/^https?:\/\/[A-Za-z0-9.-]+(:\d{1,5})?\/?$/.test(doc.url)) return 'The address PCs use must look like http://server:8530';
+  if (doc.clientCollectionId != null && doc.clientCollectionId !== '' && !str(doc.clientCollectionId, 64)) return 'clientCollectionId is invalid';
+  return null;
+}
+const STEP_TYPES = ['readiness', 'bitlocker', 'script', 'app', 'upgrade', 'restart'];
+const SHA256 = /^[A-Fa-f0-9]{64}$/;
+// Windows images and task sequences are checked here because agents run them as SYSTEM.
+function checkOs(kind, doc) {
+  if (kind === 'osImage') {
+    if (!['iso', 'assistant'].includes(doc.source)) return 'source must be iso or assistant';
+    if (!(Number.isInteger(Number(doc.build)) && Number(doc.build) >= 10240 && Number(doc.build) < 100000)) return 'build must be a Windows build number, e.g. 26100';
+    doc.build = Number(doc.build);
+    if (!['x64', 'arm64'].includes(doc.architecture || 'x64')) return 'architecture must be x64 or arm64';
+    if (doc.source === 'iso') {
+      const u = String(doc.url || '').trim();
+      if (!/^https:\/\/\S+$/i.test(u) && !/^\\\\[^\\\s]+\\\S+$/.test(u)) return 'The ISO location must start with https:// or be a network share path like \\\\server\\share\\Win11.iso';
+      doc.url = u;
+      if (doc.sha256 && !SHA256.test(doc.sha256)) return 'sha256 must be 64 hex characters';
+    } else { delete doc.url; delete doc.sha256; }
+  }
+  if (kind === 'taskSequence') {
+    if (!Array.isArray(doc.steps) || !doc.steps.length || doc.steps.length > 30) return 'A task sequence needs 1 to 30 steps';
+    if (doc.steps.some(s => !s || !STEP_TYPES.includes(s.type))) return `Step types are ${STEP_TYPES.join(', ')}`;
+    if (doc.steps.some(s => (s.type === 'upgrade' && !str(s.imageId, 64)) || (s.type === 'script' && !str(s.scriptId, 64)) || (s.type === 'app' && !str(s.appId, 64)))) return 'Every step needs its image, script or application';
+  }
+  return null;
+}
 const publicDevice = ({ keyHash, ...d }) => d;
 
 async function consoleState(user, headers) {
   await ensureDefaults();
   const ctx = await loadCtx(true);
-  const [docs, scripts, alerts, logs, commands, scriptRuns] = await Promise.all([
-    db.listDevices(), db.listObjects('script'), db.listObjects('alert', { limit: 200 }), db.listObjects('log', { limit: 300 }),
+  const [docs, alerts, logs, commands, scriptRuns] = await Promise.all([
+    db.listDevices(), db.listObjects('alert', { limit: 200 }), db.listObjects('log', { limit: 300 }),
     db.listObjects('command', { limit: 300 }), db.listObjects('scriptRun', { limit: 50 }),
   ]);
   return {
@@ -356,9 +456,11 @@ async function consoleState(user, headers) {
       now: Date.now(), version: VERSION, storage: db.kind, user, viewerIp: clientIp(headers),
       enrollmentConfigured: Boolean(process.env.AGENT_ENROLL_TOKEN),
       tailscaleKey: await vpnKeyInfo(),
+      // Which devices have a recovery key saved; the keys themselves are fetched one device at a time.
+      recoveryKeys: (await db.listObjects('recoveryKey')).map(({ password, ...k }) => k),
       ggvpn: await vpnInfo(), vpnClients: await db.listObjects('vpnClient'),
       devices: docs.map(d => M.deviceView(d, ctx)), updates: M.updateCatalogue(docs),
-      ...ctx, scripts, alerts, log: logs, commands, scriptRuns,
+      ...ctx, alerts, log: logs, commands, scriptRuns,
     },
   };
 }
@@ -371,8 +473,11 @@ async function putObject(kind, id, body, user) {
   const existing = await db.getObject(kind, id);
   if (kind === 'collection' && existing?.builtIn) return { status: 409, body: { error: 'Built-in collections cannot be changed' } };
   if (kind === 'baseline') { if (!existing) return { status: 404, body: { error: 'Unknown baseline' } }; doc = { ...existing, remediate: !!doc.remediate }; }
+  if (kind === 'updateServer') doc.name = doc.name || 'Local update server';
   if (kind !== 'baseline' && kind !== 'settings' && !str(doc.name, 200)) return { status: 400, body: { error: 'name is required' } };
   if (kind === 'collection') doc.builtIn = false;
+  const osErr = kind === 'updateServer' ? (id === 'main' ? checkUpdateServer(doc) : 'There is one update server, with id main') : checkOs(kind, doc);
+  if (osErr) return { status: 400, body: { error: osErr } };
   if (kind === 'settings') doc = { ...DEFAULTS.settings, ...(existing || {}), ...doc, id: 'main' };
   if (kind === 'settings') {
     const gw = String(doc.rdGateway || '').trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
@@ -393,9 +498,15 @@ async function deleteObject(kind, id, query, user) {
     if (existing.builtIn) return { status: 409, body: { error: 'Built-in collections cannot be deleted' } };
     const used = [...await db.listObjects('deployment', { where: { collectionId: id } }), ...await db.listObjects('adr', { where: { collectionId: id } }), ...await db.listObjects('maintenanceWindow', { where: { collectionId: id } })];
     if (used.length) return { status: 409, body: { error: 'Remove the deployments, rules and maintenance windows that use this collection first' } };
+    if ((await db.getObject('updateServer', 'main'))?.clientCollectionId === id) return { status: 409, body: { error: 'The local update server uses this collection. Change it on the Windows Update Manager page first.' } };
   }
-  if (kind === 'app' || kind === 'updateGroup') {
+  if (kind === 'app' || kind === 'updateGroup' || kind === 'taskSequence') {
     if ((await db.listObjects('deployment', { where: { targetId: id } })).length) return { status: 409, body: { error: 'Delete the deployments of this first' } };
+  }
+  if (kind === 'osImage' || kind === 'app' || kind === 'script') {
+    const key = { osImage: 'imageId', app: 'appId', script: 'scriptId' }[kind];
+    const uses = (await db.listObjects('taskSequence')).filter(t => (t.steps || []).some(s => s[key] === id));
+    if (uses.length) return { status: 409, body: { error: `Remove it from these task sequences first: ${uses.map(t => t.name).join(', ')}` } };
   }
   await db.deleteObject(kind, id);
   ctxCache = null;
@@ -404,15 +515,26 @@ async function deleteObject(kind, id, query, user) {
 }
 
 const PLATFORMS_FOR = { PowerShell: ['Windows'], Shell: ['macOS', 'Linux'] };
-const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop', vpnjoin: 'Join Tailscale', vpnleave: 'Leave Tailscale', ggvpnon: 'Connect to the Go-Green VPN', ggvpnoff: 'Disconnect from the Go-Green VPN' };
+const COMMAND_NAMES = { restart: 'Restart', inventory: 'Refresh inventory', updscan: 'Scan for updates', remoteon: 'Turn on remote desktop', remoteoff: 'Turn off remote desktop', vpnjoin: 'Join Tailscale', vpnleave: 'Leave Tailscale', ggvpnon: 'Connect to the Go-Green VPN', ggvpnoff: 'Disconnect from the Go-Green VPN', encon: 'Turn on disk encryption', encoff: 'Turn off disk encryption', wsussetup: 'Set up the local update server', wsussync: 'Synchronize with Microsoft Update', wsusapprove: 'Approve updates', wsusdecline: 'Decline updates' };
 const GGVPN_PLATFORMS = ['Windows', 'Linux'];
 const REMOTE_PLATFORMS = ['Windows', 'macOS'];
 async function createCommands(b, user) {
   const ids = arr(b.deviceIds, 2000) || [];
   if (!ids.length) return { status: 400, body: { error: 'deviceIds is required' } };
-  if (!['script', 'restart', 'inventory', 'updscan', 'remoteon', 'remoteoff', 'vpnjoin', 'vpnleave', 'ggvpnon', 'ggvpnoff'].includes(b.type)) return { status: 400, body: { error: 'type must be script, restart, inventory, updscan, remoteon, remoteoff, vpnjoin, vpnleave, ggvpnon or ggvpnoff' } };
+  if (!Object.keys(COMMAND_NAMES).concat('script').includes(b.type)) return { status: 400, body: { error: `type must be one of: script, ${Object.keys(COMMAND_NAMES).join(', ')}` } };
   if (b.type === 'ggvpnon' && !vpnConfig().configured) return { status: 409, body: { error: 'The Go-Green VPN server isn’t set up in the Device Manager yet (GGVPN_SERVER_PUBKEY in Azure).' } };
   if (b.type === 'vpnjoin' && !(await tailscaleKey())) return { status: 409, body: { error: 'Save a Tailscale auth key on the VPN page first' } };
+  let wsusCmd = null;
+  if (b.type.startsWith('wsus')) {
+    const us = await db.getObject('updateServer', 'main');
+    if (!us) return { status: 409, body: { error: 'Save the update server settings first' } };
+    if (ids.length !== 1 || ids[0] !== us.deviceId) return { status: 400, body: { error: 'Update server actions go to the update server device only' } };
+    if (b.type === 'wsusapprove' || b.type === 'wsusdecline') {
+      const ups = (arr(b.updates, 200) || []).filter(u => GUID.test(String(u)));
+      if (!ups.length) return { status: 400, body: { error: 'updates: the update IDs to approve or decline' } };
+      wsusCmd = { updates: ups };
+    }
+  }
   let script = null;
   if (b.type === 'script') { script = str(b.scriptId, 64) ? await db.getObject('script', b.scriptId) : null; if (!script) return { status: 404, body: { error: 'Unknown script' } }; }
   const devices = new Map((await db.listDevices()).map(d => [d.id, d]));
@@ -427,6 +549,10 @@ async function createCommands(b, user) {
     }
     if (b.type.startsWith('remote') && !REMOTE_PLATFORMS.includes(d.platform)) return { ...c, status: 'skipped', output: `Remote desktop is managed on Windows and macOS only, not ${d.platform}.` };
     if (b.type.startsWith('ggvpn') && !GGVPN_PLATFORMS.includes(d.platform)) return { ...c, status: 'skipped', output: 'On a Mac, download a Mac installer from the VPN page and open it in the WireGuard app.' };
+    if (b.type.startsWith('wsus') && (d.platform !== 'Windows' || !/server/i.test(d.os || ''))) return { ...c, status: 'skipped', output: 'The update server (WSUS) runs on Windows Server only.' };
+    if (wsusCmd) Object.assign(c, wsusCmd, { name: `${COMMAND_NAMES[b.type]} (${wsusCmd.updates.length})` });
+    if (b.type.startsWith('enc') && d.platform === 'Linux') return { ...c, status: 'skipped', output: 'Linux disk encryption (LUKS) is set up when Linux is installed; it can’t be turned on or off remotely.' };
+    if (b.type === 'encoff' && d.platform === 'macOS') return { ...c, status: 'skipped', output: 'Turning FileVault off needs the Mac user’s password: they turn it off in System Settings → Privacy & Security → FileVault.' };
     return c;
   });
   // The Go-Green VPN: give each connecting device its own address, and stop listing disconnected ones.
@@ -441,7 +567,7 @@ async function createCommands(b, user) {
   }
   await db.putMany('command', cmds);
   await db.putObject('scriptRun', runId, { id: runId, t: now, type: b.type, script: script ? script.name : COMMAND_NAMES[b.type], count: cmds.length, by: user });
-  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : b.type.startsWith('vpn') || b.type.startsWith('ggvpn') ? 'VPN' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
+  await log(script ? 'Scripts' : b.type.startsWith('remote') ? 'Remote desktop' : b.type.startsWith('vpn') || b.type.startsWith('ggvpn') ? 'VPN' : b.type.startsWith('enc') ? 'Disk encryption' : b.type.startsWith('wsus') ? 'Update server' : 'Client notification', `${script ? `Ran “${script.name}”` : COMMAND_NAMES[b.type]} on ${cmds.length} device${cmds.length === 1 ? '' : 's'}`, 'info', user);
   return { status: 200, body: { runId, commands: cmds.map(({ body, ...c }) => c) } };
 }
 
@@ -461,6 +587,7 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
     if (route === 'GET /api/agent/policy') return policy(query, headers);
     if (route === 'POST /api/agent/status') return status(body || {}, headers);
     if (route === 'POST /api/agent/result') return commandResult(body || {}, headers);
+    if (route === 'POST /api/agent/escrow') return escrow(body || {}, headers);
     return { status: 404, body: { error: 'Not found' } };
   }
 
@@ -485,7 +612,12 @@ async function route_({ method, path, query = {}, body = {}, headers = {} }) {
       await db.putMany('alert', pick.map(a => ({ ...a, ack: true, ackBy: user })));
       return { status: 200, body: { acknowledged: pick.length } };
     }
-    let m = /^\/api\/console\/devices\/([\w-]{1,64})$/.exec(path);
+    let m = /^\/api\/console\/devices\/([\w-]{1,64})\/recovery-keys$/.exec(path);
+    if (m && method === 'GET') {
+      const doc = await db.getDevice(m[1]);
+      return doc ? recoveryKeys(doc, user) : { status: 404, body: { error: 'Unknown device' } };
+    }
+    m = /^\/api\/console\/devices\/([\w-]{1,64})$/.exec(path);
     if (m) {
       const doc = await db.getDevice(m[1]);
       if (!doc) return { status: 404, body: { error: 'Unknown device' } };

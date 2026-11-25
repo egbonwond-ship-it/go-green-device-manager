@@ -70,7 +70,8 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
   // The Go-Green VPN, pointed at a documentation address so the test tunnel never carries real traffic.
   const vpnKey = require('crypto').generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
   const vpnEnv = { GGVPN_SERVER_PUBKEY: vpnKey, GGVPN_ENDPOINT: '192.0.2.1:51820', GGVPN_DNS: 'none', GGVPN_ROUTES: '10.99.0.0/24' };
-  const server = spawn(process.execPath, [path.join(ROOT, 'dev-server.js')], { env: { ...process.env, ...vpnEnv, PORT: String(PORT) }, stdio: 'inherit' });
+  // GitHub's Windows machines run Windows Server, which task sequences normally skip.
+  const server = spawn(process.execPath, [path.join(ROOT, 'dev-server.js')], { env: { ...process.env, ...vpnEnv, OSD_ALLOW_SERVER: '1', PORT: String(PORT) }, stdio: 'inherit' });
   try {
     for (let i = 0; i < 50; i++) { try { await fetch(BASE + '/api/health'); break; } catch { await new Promise(r => setTimeout(r, 200)); } }
     await api('GET', '/api/console/state'); // creates the built-in collections and scripts
@@ -146,6 +147,71 @@ TEST_APP.detectName = process.platform === 'linux' ? 'ggt-test-app' : 'GGT Test 
     agent(WIN ? '-Run' : 'run');
     st = await api('GET', '/api/console/state');
     assert.ok(!st.devices[0].installed.includes('app-e2e'), 'test app removed');
+
+    // Disk encryption: every agent reports it. GitHub's Windows machines run Windows Server without the
+    // BitLocker feature, so turning it on must fail with a clear reason; Linux is report-only. (Not run
+    // on the Mac, where it would set up FileVault on the test machine.)
+    console.log('Disk encryption:', JSON.stringify(st.devices[0].encryption));
+    assert.equal(st.devices[0].encryption?.kind, WIN ? 'BitLocker' : MAC ? 'FileVault' : 'LUKS', 'encryption reported');
+    if (!MAC) {
+      const er = await api('POST', '/api/console/commands', { type: 'encon', deviceIds: [dev.id] });
+      if (WIN) {
+        agent('-Run');
+        st = await api('GET', '/api/console/state');
+        const ec = st.commands.find(c => c.runId === er.runId);
+        console.log('Turn on encryption:', ec.status, ec.output);
+        assert.ok(ec.status === 'succeeded' || /BitLocker|TPM/.test(ec.output), 'turning BitLocker on succeeds or explains why not');
+      } else assert.equal(er.commands[0].status, 'skipped', 'LUKS is report-only');
+    }
+
+    // Local update server: PCs in its collection get Windows Update pointed at it, and back again when
+    // it's removed. (Installing WSUS itself takes too long for CI and needs Microsoft Update.)
+    if (WIN) {
+      const url = 'http://wsus.example.invalid:8530';
+      await api('PUT', '/api/console/objects/updateServer/main', { doc: { id: 'main', deviceId: 'some-server', url, products: ['Windows 11'], classifications: ['Security Updates'], clientCollectionId: 'c-all' } });
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      console.log('Windows Update server:', st.devices[0].wuServer);
+      assert.equal(st.devices[0].wuServer, url, 'PC pointed at the local update server');
+      await api('DELETE', '/api/console/objects/updateServer/main');
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      assert.equal(st.devices[0].wuServer, null, 'setting removed again');
+      assert.equal(st.devices[0].wsus, null, 'not an update server');
+    }
+
+    // Windows OS deployment: task sequences run step by step. This can't really upgrade the runner,
+    // so it checks a readiness failure, a full run of the other steps, a PC already on the target
+    // build, and an upgrade whose image can't be fetched.
+    if (WIN) {
+      console.log('Windows 11 readiness:', JSON.stringify(st.devices[0].osReady));
+      assert.ok(st.devices[0].osReady && ['x64', 'arm64'].includes(st.devices[0].osReady.arch), 'Windows 11 readiness reported');
+      await api('DELETE', '/api/console/objects/deployment/dep-e2e');
+      const put = (kind, doc) => api('PUT', `/api/console/objects/${kind}/${doc.id}`, { doc });
+      await put('osImage', { id: 'img-old', name: 'Old Windows', source: 'iso', build: 10240, url: 'https://example.com/old.iso' });
+      await put('osImage', { id: 'img-missing', name: 'Missing', source: 'iso', build: 99999, url: '\\\\localhost\\ggt-no-such-share\\win.iso' });
+      await put('taskSequence', { id: 'ts-ready', name: 'Needs a huge disk', steps: [{ type: 'readiness', minFreeGB: 100000 }, { type: 'restart' }] });
+      await put('taskSequence', { id: 'ts-run', name: 'Full run', steps: [{ type: 'readiness', minFreeGB: 1 }, { type: 'bitlocker' }, { type: 'script', scriptId: 'net' }, { type: 'app', appId: 'app-e2e' }] });
+      await put('taskSequence', { id: 'ts-done', name: 'Already upgraded', steps: [{ type: 'readiness', minFreeGB: 100000 }, { type: 'upgrade', imageId: 'img-old' }] });
+      await put('taskSequence', { id: 'ts-fetch', name: 'Unreachable image', steps: [{ type: 'upgrade', imageId: 'img-missing' }] });
+      for (const t of ['ts-ready', 'ts-run', 'ts-fetch', 'ts-done']) await put('deployment', { id: `dep-${t}`, name: t, kind: 'os', targetId: t, collectionId: 'c-all', enabled: true, respectMW: false, restart: 'Suppress' });
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      const ds = st.devices[0].depState;
+      console.log('Task sequences:', JSON.stringify({ ready: ds['dep-ts-ready'], run: ds['dep-ts-run'], fetch: ds['dep-ts-fetch'], done: ds['dep-ts-done'] }));
+      assert.equal(ds['dep-ts-ready']?.state, 'reqnotmet', 'readiness failure reported');
+      assert.equal(ds['dep-ts-ready'].errorCode, 'NOT_READY');
+      assert.equal(ds['dep-ts-run']?.state, 'success', 'task sequence ran every step');
+      assert.ok(st.devices[0].installed.includes('app-e2e'), 'the task sequence installed the app');
+      assert.equal(ds['dep-ts-fetch']?.state, 'error', 'unreachable image reported');
+      assert.ok(['DOWNLOAD', '0x80070070'].includes(ds['dep-ts-fetch'].errorCode), `image error code ${ds['dep-ts-fetch'].errorCode}`);
+      assert.equal(ds['dep-ts-done']?.state, 'success', 'a PC already on the target build counts as done');
+      assert.match(ds['dep-ts-done'].message || '', /Already on Windows build/);
+      // A finished task sequence doesn't run again.
+      agent('-Run');
+      st = await api('GET', '/api/console/state');
+      assert.equal(st.devices[0].depState['dep-ts-run'].at, ds['dep-ts-run'].at, 'finished task sequence not rerun');
+    }
 
     if (SCAN) {
       const d3 = st.devices[0];

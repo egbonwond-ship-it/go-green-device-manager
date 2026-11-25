@@ -13,7 +13,8 @@
     2. scans Windows Update for missing updates (every 6 hours, or when asked),
     3. checks in, then pulls its policy from the Device Manager,
     4. runs queued scripts and actions, fixes settings for baselines with remediation on,
-       installs or removes deployed applications and installs approved updates,
+       installs or removes deployed applications, installs approved updates and runs Windows
+       upgrade task sequences (which carry on across restarts),
     5. reports each result back.
   Files: C:\ProgramData\GGT Agent (config.json holds the device key; only SYSTEM and Administrators can read it).
 #>
@@ -29,7 +30,7 @@ param(
   [string]$AgentDir = (Join-Path $env:ProgramData 'GGT Agent')
 )
 
-$AgentVersion = '2.3.0'
+$AgentVersion = '2.6.0'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -124,6 +125,7 @@ function Get-Inventory {
     agentVersion = $AgentVersion
     joinType = $join.joinType; domain = $join.domain; netbiosDomain = $join.netbiosDomain; fqdn = $join.fqdn
     ips = $ips; rdpPort = if ($rdpPort) { [int]$rdpPort } else { $null }; tailscale = Get-Tailscale; fortiConnected = Get-FortiConnected; ggvpn = Get-GoGreenVpn
+    osReady = Get-OsReadiness; encryption = Get-Encryption; wuServer = Get-WuServer; wsus = Get-WsusInfo
   }
 }
 
@@ -329,6 +331,229 @@ function Get-Security {
   return $s
 }
 
+# ---------------------------------------------------------------- disk encryption (BitLocker)
+$BlNs = 'root\cimv2\Security\MicrosoftVolumeEncryption'
+function Get-SystemVolume { Get-CimInstance -Namespace $BlNs -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction Stop }
+$BlMethods = @{ 0 = 'None'; 1 = 'AES 128 + Diffuser'; 2 = 'AES 256 + Diffuser'; 3 = 'AES 128'; 4 = 'AES 256'; 5 = 'Hardware'; 6 = 'XTS-AES 128'; 7 = 'XTS-AES 256' }
+$BlProtectors = @{ 1 = 'TPM'; 2 = 'Startup key'; 3 = 'Recovery password'; 4 = 'TPM and PIN'; 5 = 'TPM and startup key'; 6 = 'TPM, PIN and startup key'; 7 = 'Public key'; 8 = 'Passphrase'; 9 = 'TPM certificate'; 10 = 'Active Directory account' }
+function Get-BlProtectors($Volume) {
+  $ids = @((Invoke-CimMethod -InputObject $Volume -MethodName GetKeyProtectors -Arguments @{ KeyProtectorType = [uint32]0 }).VolumeKeyProtectorID)
+  foreach ($id in $ids) { if ($id) { @{ id = $id; type = [int](Invoke-CimMethod -InputObject $Volume -MethodName GetKeyProtectorType -Arguments @{ VolumeKeyProtectorID = $id }).KeyProtectorType } } }
+}
+function Get-Encryption {
+  $e = [ordered]@{ kind = 'BitLocker'; status = $null; percent = $null; method = $null; protectors = @(); available = $false; note = $null }
+  try { $v = Get-SystemVolume } catch { $v = $null }
+  if (-not $v) { $e.note = "BitLocker isn't available on this edition of Windows"; return $e }
+  $e.available = $true
+  try {
+    $cs = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus
+    $e.percent = [int]$cs.EncryptionPercentage
+    $e.status = switch ([int]$cs.ConversionStatus) {
+      0 { 'off' } 1 { if ([int]$v.ProtectionStatus -eq 1) { 'on' } else { 'suspended' } } 2 { 'encrypting' } 3 { 'decrypting' } default { 'paused' }
+    }
+    $m = [int](Invoke-CimMethod -InputObject $v -MethodName GetEncryptionMethod).EncryptionMethod
+    if ($m) { $e.method = $BlMethods[$m] }
+    $e.protectors = @(Get-BlProtectors $v | ForEach-Object { $BlProtectors[$_.type] } | Where-Object { $_ } | Select-Object -Unique)
+  } catch { $e.note = $_.Exception.Message }
+  return $e
+}
+# Sends the system drive's recovery password to the Device Manager. Only called when the agent turns
+# BitLocker on, so an admin can unlock the PC if it ever asks for its recovery key.
+function Send-RecoveryKeys {
+  $v = Get-SystemVolume
+  $keys = @(Get-BlProtectors $v | Where-Object { $_.type -eq 3 } | ForEach-Object {
+    $pw = (Invoke-CimMethod -InputObject $v -MethodName GetKeyProtectorNumericalPassword -Arguments @{ VolumeKeyProtectorID = $_.id }).NumericalPassword
+    if ($pw) { @{ kind = 'BitLocker'; keyId = "$($_.id)"; volume = $env:SystemDrive; password = "$pw" } } })
+  if (-not $keys.Count) { return $false }
+  try { Invoke-Api 'POST' '/api/agent/escrow' @{ deviceId = $script:Config.deviceId; keys = $keys } | Out-Null; return $true }
+  catch { Write-Log "Couldn't save the recovery key: $($_.Exception.Message)" 'warn'; return $false }
+}
+function Test-BlResult($r, [string]$What) {
+  if ([uint32]$r.ReturnValue -ne 0) { throw ("$What failed (0x{0:X8})" -f [uint32]$r.ReturnValue) }
+}
+function Enable-DiskEncryption {
+  try { $v = Get-SystemVolume } catch { $v = $null }
+  if (-not $v) { throw "BitLocker isn't available on this edition of Windows. Windows Home has Device Encryption instead, which Windows turns on itself when someone signs in with a Microsoft account." }
+  $cs = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus
+  if ([int]$cs.ConversionStatus -eq 1 -and [int]$v.ProtectionStatus -eq 1) { return "BitLocker is already on for $env:SystemDrive." }
+  if ([int]$cs.ConversionStatus -eq 1) {
+    Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName EnableKeyProtectors) 'Resuming BitLocker'
+    return "BitLocker protection resumed on $env:SystemDrive."
+  }
+  $tpm = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction SilentlyContinue
+  if (-not $tpm -or -not (Invoke-CimMethod -InputObject $tpm -MethodName IsReady).IsReady) { throw 'This PC has no TPM ready for BitLocker. Turn the TPM on in the firmware (BIOS/UEFI) settings, then try again.' }
+  $prot = @(Get-BlProtectors $v)
+  if (-not ($prot | Where-Object { @(1, 4, 5, 6) -contains $_.type })) { Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName ProtectKeyWithTPM -Arguments @{ FriendlyName = 'Go-Green Device Manager' }) 'Adding the TPM protector' }
+  if (-not ($prot | Where-Object { $_.type -eq 3 })) { Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName ProtectKeyWithNumericalPassword -Arguments @{ FriendlyName = 'Go-Green Device Manager' }) 'Adding a recovery password' }
+  # The recovery key must be safely saved before any data is encrypted.
+  if (-not (Send-RecoveryKeys)) { throw "Couldn't save the recovery key to the Device Manager, so encryption wasn't started. Try again." }
+  Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName Encrypt -Arguments @{ EncryptionMethod = [uint32]7; EncryptionFlags = [uint32]1 }) 'Starting encryption'
+  return "BitLocker is encrypting $env:SystemDrive (XTS-AES 256, used space only). The PC stays usable while it runs. The recovery key is saved in the Device Manager."
+}
+function Disable-DiskEncryption {
+  try { $v = Get-SystemVolume } catch { $v = $null }
+  if (-not $v) { return "BitLocker isn't available on this edition of Windows, so there's nothing to turn off." }
+  $cs = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus
+  if ([int]$cs.ConversionStatus -eq 0) { return "BitLocker is already off for $env:SystemDrive." }
+  Test-BlResult (Invoke-CimMethod -InputObject $v -MethodName Decrypt) 'Starting decryption'
+  return "BitLocker is decrypting $env:SystemDrive. The PC stays usable while it runs."
+}
+
+# ---------------------------------------------------------------- local update server (WSUS)
+# On the Windows Server chosen in the Device Manager, the agent installs and configures WSUS, which
+# synchronizes with Microsoft Update (its upstream), downloads approved updates and serves them to
+# PCs on the network. PCs in the chosen collection get Windows Update pointed at it.
+$WsusSetupKey = 'HKLM:\SOFTWARE\Microsoft\Update Services\Server\Setup'
+$script:WsusFull = $false
+function Get-WsusApi {
+  Import-Module UpdateServices -ErrorAction Stop
+  return Get-WsusServer -ErrorAction Stop
+}
+function Get-WsusInfo {
+  if (-not (Get-Service WsusService -ErrorAction SilentlyContinue)) { return $null }
+  $info = [ordered]@{ installed = $true; port = $null; lastSync = $null; lastSyncResult = $null; syncing = $null; nextSync = $null; freeGB = $null; contentDir = $null; computers = $null; error = $null }
+  try {
+    $setup = Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue
+    $info.port = if ($setup.PortNumber) { [int]$setup.PortNumber } else { 8530 }
+    $info.contentDir = "$($setup.ContentDir)"
+    if ($setup.ContentDir) {
+      $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$(([IO.Path]::GetPathRoot($setup.ContentDir)).TrimEnd('\'))'"
+      if ($d) { $info.freeGB = [math]::Round($d.FreeSpace / 1GB) }
+    }
+    $w = Get-WsusApi
+    $sub = $w.GetSubscription()
+    $last = $sub.GetLastSynchronizationInfo()
+    if ($last) { $info.lastSync = Iso $last.EndTime.ToLocalTime(); $info.lastSyncResult = "$($last.Result)" }
+    $info.syncing = ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing')
+    if ($sub.SynchronizeAutomatically) { $info.nextSync = Iso $sub.GetNextSynchronizationTime().ToLocalTime() }
+    $info.computers = [int]$w.GetStatus().ComputerTargetCount
+    if ($script:WsusFull) { $info.updates = @(Get-WsusNeeded $w) }
+  } catch { $info.error = $_.Exception.Message }
+  return $info
+}
+# The updates PCs reporting to this server still need, most-needed first.
+function Get-WsusNeeded($W) {
+  $us = New-Object Microsoft.UpdateServices.Administration.UpdateScope
+  $cs = New-Object Microsoft.UpdateServices.Administration.ComputerTargetScope
+  $sums = @($W.GetSummariesPerUpdate($us, $cs) | Where-Object { ($_.NotInstalledCount + $_.DownloadedCount + $_.FailedCount) -gt 0 } |
+    Sort-Object { $_.NotInstalledCount + $_.DownloadedCount + $_.FailedCount } -Descending | Select-Object -First 150)
+  foreach ($s in $sums) {
+    try {
+      $u = $W.GetUpdate((New-Object Microsoft.UpdateServices.Administration.UpdateRevisionId($s.UpdateId)))
+      $kb = if ($u.KnowledgebaseArticles.Count) { 'KB' + $u.KnowledgebaseArticles[0] } else { $null }
+      [ordered]@{ id = "$($s.UpdateId)"; kb = $kb; title = "$($u.Title)"; classification = "$($u.UpdateClassificationTitle)"; severity = $(if ("$($u.MsrcSeverity)" -in @('Critical', 'Important', 'Moderate', 'Low')) { "$($u.MsrcSeverity)" } else { $null })
+        released = Iso $u.CreationDate; needed = [int]($s.NotInstalledCount + $s.DownloadedCount + $s.FailedCount); installed = [int]$s.InstalledCount; approved = [bool]$u.IsApproved; declined = [bool]$u.IsDeclined }
+    } catch { }
+  }
+}
+function Install-WsusServer($Cfg) {
+  if (-not $Cfg) { throw 'No update server settings were sent. Save them on the Windows Update Manager page first.' }
+  if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) { throw 'WSUS runs on Windows Server only.' }
+  if (-not (Get-WindowsFeature UpdateServices).Installed) {
+    Write-Log 'Installing the WSUS role'
+    $r = Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
+    if (-not $r.Success) { throw "Installing the WSUS role failed: $($r.ExitCode)" }
+  }
+  $dir = "$($Cfg.contentDir)"
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  if (-not (Get-ItemProperty $WsusSetupKey -ErrorAction SilentlyContinue).ContentDir) {
+    Write-Log "Running WSUS post-install (updates kept in $dir)"
+    $p = Invoke-Process "$env:ProgramFiles\Update Services\Tools\wsusutil.exe" @('postinstall', "CONTENT_DIR=`"$dir`"") 3600
+    if ($p.exitCode -ne 0) { throw "WSUS post-install failed ($($p.exitCode)): $(("$($p.output)" -split "`n" | Select-Object -Last 3) -join ' ')" }
+  }
+  $w = Get-WsusApi
+  Set-WsusServerSynchronization -UpdateServer $w -SyncFromMU | Out-Null
+  $c = $w.GetConfiguration()
+  $c.AllUpdateLanguagesEnabled = $false
+  $c.SetEnabledUpdateLanguages([string[]]@($Cfg.languages))
+  $c.Save()
+  $sub = $w.GetSubscription()
+  # The first time, fetch the list of products and classifications from Microsoft before choosing.
+  if (-not @($w.GetUpdateCategories()).Count) {
+    Write-Log 'Getting the product list from Microsoft Update'
+    $sub.StartSynchronizationForCategoryOnly()
+    $until = (Get-Date).AddMinutes(45)
+    do { Start-Sleep -Seconds 20 } while ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing' -and (Get-Date) -lt $until)
+  }
+  $cats = New-Object Microsoft.UpdateServices.Administration.UpdateCategoryCollection
+  $found = @()
+  foreach ($p in $w.GetUpdateCategories()) { if (@($Cfg.products) -contains $p.Title) { [void]$cats.Add($p); $found += $p.Title } }
+  $sub.SetUpdateCategories($cats)
+  $cls = New-Object Microsoft.UpdateServices.Administration.UpdateClassificationCollection
+  foreach ($k in $w.GetUpdateClassifications()) { if (@($Cfg.classifications) -contains $k.Title) { [void]$cls.Add($k) } }
+  $sub.SetUpdateClassifications($cls)
+  # Sync once a day at the chosen local time (WSUS keeps the time in UTC).
+  $t = [TimeSpan]::Parse("$($Cfg.syncTime)") - [TimeZoneInfo]::Local.GetUtcOffset((Get-Date))
+  if ($t.TotalHours -lt 0) { $t = $t.Add([TimeSpan]::FromDays(1)) } elseif ($t.TotalHours -ge 24) { $t = $t.Subtract([TimeSpan]::FromDays(1)) }
+  $sub.SynchronizeAutomatically = $true
+  $sub.SynchronizeAutomaticallyTimeOfDay = $t
+  $sub.NumberOfSynchronizationsPerDay = 1
+  $sub.Save()
+  $port = [int]$Cfg.port; if (-not $port) { $port = 8530 }
+  if (-not (Get-NetFirewallRule -Name 'GGT-WSUS' -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -Name 'GGT-WSUS' -DisplayName 'Go-Green update server (WSUS)' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
+  }
+  $sub.StartSynchronization()
+  $script:State.wsusForce = $true
+  $missing = @(@($Cfg.products) | Where-Object { $found -notcontains $_ })
+  $note = if ($missing.Count) { " Microsoft Update has no product called: $($missing -join ', ')." } else { '' }
+  return "WSUS is set up on $env:COMPUTERNAME (port $port, updates kept in $dir) and is synchronizing with Microsoft Update. The first sync takes 30-90 minutes; then it syncs daily at $($Cfg.syncTime).$note"
+}
+function Start-WsusSync {
+  $sub = (Get-WsusApi).GetSubscription()
+  if ("$($sub.GetSynchronizationStatus())" -ne 'NotProcessing') { return 'A synchronization is already running.' }
+  $sub.StartSynchronization()
+  $script:State.wsusForce = $true
+  return 'Synchronizing with Microsoft Update. New updates show here when it finishes.'
+}
+# Approved updates are downloaded from Microsoft by the server, then installed by the PCs that need them.
+function Set-WsusApproval($Ids, [bool]$Approve) {
+  $w = Get-WsusApi
+  $all = $w.GetComputerTargetGroups() | Where-Object { $_.Name -eq 'All Computers' } | Select-Object -First 1
+  $n = 0; $errs = @()
+  foreach ($id in @($Ids)) {
+    try {
+      $u = $w.GetUpdate((New-Object Microsoft.UpdateServices.Administration.UpdateRevisionId([guid]$id)))
+      if ($Approve) {
+        if ($u.RequiresLicenseAgreementAcceptance) { $u.AcceptLicenseAgreement() }
+        [void]$u.Approve([Microsoft.UpdateServices.Administration.UpdateApprovalAction]::Install, $all)
+      } else { $u.Decline() }
+      $n++
+    } catch { $errs += "${id}: $($_.Exception.Message)" }
+  }
+  $script:State.wsusForce = $true
+  $msg = if ($Approve) { "Approved $n update(s). The server downloads them from Microsoft, then PCs install them at their next update check." } else { "Declined $n update(s)." }
+  if ($errs.Count) { throw "$msg Failed: $($errs -join '; ')" }
+  return $msg
+}
+
+# PCs: point Windows Update at the local server, or undo it when the Device Manager stops doing so.
+$WuKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+function Get-WuServer {
+  $p = Get-ItemProperty $WuKey -ErrorAction SilentlyContinue
+  $use = (Get-ItemProperty "$WuKey\AU" -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
+  if ($p.WUServer -and $use -eq 1) { return "$($p.WUServer)" }
+  return $null
+}
+function Set-WuClient([string]$Url, $State) {
+  if ($Url) {
+    if ((Get-WuServer) -eq $Url) { $State.wuSetByAgent = $true; return $null }
+    if (-not (Test-Path "$WuKey\AU")) { New-Item -Path "$WuKey\AU" -Force | Out-Null }
+    Set-ItemProperty $WuKey -Name WUServer -Value $Url
+    Set-ItemProperty $WuKey -Name WUStatusServer -Value $Url
+    New-ItemProperty "$WuKey\AU" -Name UseWUServer -Value 1 -PropertyType DWord -Force | Out-Null
+    $State.wuSetByAgent = $true
+    return "Windows Update now uses the local update server $Url"
+  }
+  if ($State.wuSetByAgent) {
+    Remove-ItemProperty $WuKey -Name WUServer, WUStatusServer -ErrorAction SilentlyContinue
+    Remove-ItemProperty "$WuKey\AU" -Name UseWUServer -ErrorAction SilentlyContinue
+    $State.wuSetByAgent = $false
+    return 'Windows Update uses Microsoft Update directly again'
+  }
+  return $null
+}
+
 # ---------------------------------------------------------------- remote desktop
 $TsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
 function Get-RemoteOn {
@@ -494,11 +719,203 @@ function Invoke-Remediation($Ids, $Settings, $Sec) {
   return @{ done = $script:remediated; errors = $script:remediateErrors }
 }
 
-function Request-Restart {
+function Request-Restart([string]$Why = 'to finish installing updates') {
   if ($script:restartRequested) { return }
   $script:restartRequested = $true
-  Write-Log 'Restarting in 5 minutes'
-  & shutdown.exe /r /t 300 /c "Go-Green IT: this computer restarts in 5 minutes to finish installing updates. Save your work." /d p:2:17 | Out-Null
+  Write-Log "Restarting in 5 minutes $Why"
+  & shutdown.exe /r /t 300 /c "Go-Green IT: this computer restarts in 5 minutes $Why. Save your work." /d p:2:17 | Out-Null
+}
+
+# ---------------------------------------------------------------- Windows OS deployment
+# Windows 11 hardware requirements the agent can check (the processor list isn't checked here;
+# Windows setup checks it and the deployment shows its error code).
+function Get-OsReadiness {
+  $r = [ordered]@{ tpm = $null; secureBoot = $null; uefi = $null; arch = $null; diskFreeGB = $null }
+  try {
+    $t = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction Stop
+    $r.tpm = if ($t) { (("$(@($t)[0].SpecVersion)" -split ',')[0]).Trim() } else { '0' }
+    if (-not $r.tpm) { $r.tpm = '0' }
+  } catch { }
+  $sb = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction SilentlyContinue
+  if ($sb) { $r.uefi = $true; $r.secureBoot = ($sb.UEFISecureBootEnabled -eq 1) }
+  else { try { $r.secureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction Stop); $r.uefi = $true } catch [System.PlatformNotSupportedException] { $r.uefi = $false; $r.secureBoot = $false } catch { } }
+  $a = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+  $r.arch = switch ($a) { 'AMD64' { 'x64' } 'ARM64' { 'arm64' } 'x86' { 'x86' } default { $null } }
+  $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+  if ($disk) { $r.diskFreeGB = [math]::Round($disk.FreeSpace / 1GB) }
+  return $r
+}
+function Get-WindowsBuild { [int](Get-CimInstance Win32_OperatingSystem).BuildNumber }
+function Get-BootMs { ([DateTimeOffset](Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUnixTimeMilliseconds() }
+function New-StepError([string]$Code, [string]$Message) { $e = New-Object Exception($Message); $e.Data['code'] = $Code; return $e }
+
+# Problems that stop this PC running the task sequence, as text; none means ready.
+function Test-OsReadiness($Step) {
+  $p = @()
+  $rd = Get-OsReadiness
+  if ($Step.minFreeGB -and $null -ne $rd.diskFreeGB -and $rd.diskFreeGB -lt $Step.minFreeGB) { $p += "only $($rd.diskFreeGB) GB free on $env:SystemDrive (needs $($Step.minFreeGB) GB)" }
+  if ($Step.win11) {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+    if ($null -ne $rd.tpm -and [double]$rd.tpm -lt 2) { $p += $(if ($rd.tpm -eq '0') { 'no TPM (Windows 11 needs TPM 2.0; turn it on in the firmware settings if the PC has one)' } else { "TPM $($rd.tpm) (Windows 11 needs TPM 2.0)" }) }
+    if ($rd.uefi -eq $false) { $p += 'starts in legacy BIOS mode (Windows 11 needs UEFI with Secure Boot)' }
+    if ($cs.TotalPhysicalMemory -lt 3.8GB) { $p += "$([math]::Round($cs.TotalPhysicalMemory / 1GB, 1)) GB of memory (needs 4 GB)" }
+    if ($disk -and $disk.Size -lt 60GB) { $p += "a $([math]::Round($disk.Size / 1GB)) GB system drive (needs 64 GB)" }
+    if ($rd.arch -eq 'x86') { $p += '32-bit Windows (Windows 11 is 64-bit only)' }
+  }
+  return $p
+}
+
+function Suspend-OsBitLocker {
+  $v = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction SilentlyContinue
+  if (-not $v -or $v.ProtectionStatus -ne 1) { return "BitLocker isn't protecting the system drive; nothing to suspend" }
+  # Suspended for 3 restarts: an upgrade restarts the PC two or three times.
+  $r = Invoke-CimMethod -InputObject $v -MethodName DisableKeyProtectors -Arguments @{ DisableCount = [uint32]3 }
+  if ($r.ReturnValue -ne 0) { throw (New-StepError 'BITLOCKER' ("Couldn't suspend BitLocker (0x{0:X8})" -f $r.ReturnValue)) }
+  return 'BitLocker suspended for 3 restarts'
+}
+
+# Gets the image onto this PC: an ISO from https or a network share (checked against its SHA-256),
+# or Microsoft's Windows 11 Installation Assistant (checked by its Microsoft signature).
+function Get-OsMedia($Image) {
+  $dir = Join-Path $AgentDir 'Cache\OS'
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  if ($Image.source -eq 'assistant') {
+    $file = Join-Path $dir 'Windows11InstallationAssistant.exe'
+    try { Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2171764' -OutFile $file -UseBasicParsing -TimeoutSec 1800 } catch { throw (New-StepError 'DOWNLOAD' $_.Exception.Message) }
+    Import-SecurityModule
+    $sig = Get-AuthenticodeSignature $file
+    if ($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'O=Microsoft Corporation') { Remove-Item $file -Force; throw (New-StepError 'HASH' "The Installation Assistant isn't signed by Microsoft") }
+    return $file
+  }
+  $file = Join-Path $dir "$($Image.id).iso"
+  $hashOk = { param($f) -not $Image.sha256 -or (Get-FileHash $f -Algorithm SHA256).Hash -eq "$($Image.sha256)".ToUpper() }
+  if ((Test-Path $file) -and (& $hashOk $file)) { Write-Log 'Using the cached Windows image'; return $file }
+  Remove-Item $file -Force -ErrorAction SilentlyContinue
+  $free = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
+  if ($free -lt 20GB) { throw (New-StepError '0x80070070' "Only $([math]::Round($free / 1GB)) GB free: the image and the upgrade need about 20 GB") }
+  Write-Log "Downloading the Windows image from $($Image.url)"
+  try {
+    if ("$($Image.url)".StartsWith('\\')) { Copy-Item -LiteralPath $Image.url -Destination $file -Force }
+    else { Invoke-WebRequest -Uri $Image.url -OutFile $file -UseBasicParsing -TimeoutSec 7200 }
+  } catch { Remove-Item $file -Force -ErrorAction SilentlyContinue; throw (New-StepError 'DOWNLOAD' $_.Exception.Message) }
+  if (-not (& $hashOk $file)) { Remove-Item $file -Force; throw (New-StepError 'HASH' "The Windows image didn't match its SHA-256") }
+  return $file
+}
+
+# Runs Windows setup from the image as an in-place upgrade (apps, files and settings stay).
+# Setup prepares everything while Windows runs, then finishes during the next restart.
+function Invoke-OsUpgrade($Step) {
+  $img = $Step.image
+  $logs = Join-Path $AgentDir 'Logs\OSUpgrade'
+  if (-not (Test-Path $logs)) { New-Item -ItemType Directory -Path $logs -Force | Out-Null }
+  $arch = (Get-OsReadiness).arch
+  if ($img.architecture -and $arch -and $arch -ne $img.architecture) { throw (New-StepError 'ARCH' "This is an $arch PC and the image is $($img.architecture)") }
+  $media = Get-OsMedia $img
+  if ($img.source -eq 'assistant') {
+    $r = Invoke-Process $media @('/QuietInstall', '/SkipEULA', '/auto', 'upgrade', '/NoRestartUI', '/copylogs', "`"$logs`"") 9000
+    if ($r.timedOut) { throw (New-StepError 'TIMEOUT' "The Installation Assistant didn't finish within 2.5 hours") }
+    if ($r.exitCode -ne 0) { throw (New-StepError ('0x{0:X8}' -f $r.exitCode) "The Installation Assistant stopped with exit code $('0x{0:X8}' -f $r.exitCode)") }
+    return "The Windows 11 Installation Assistant is upgrading this PC and restarts it when it's ready"
+  }
+  $mount = Mount-DiskImage -ImagePath $media -PassThru
+  try {
+    $letter = ($mount | Get-Volume).DriveLetter
+    $setup = if ($letter) { "$($letter):\setup.exe" } else { $null }
+    if (-not $setup -or -not (Test-Path $setup)) { throw (New-StepError 'MEDIA' 'No setup.exe on the image. Use Windows installation media (an ISO from Microsoft or your volume licensing site).') }
+    $sargs = @('/auto', 'upgrade', '/quiet', '/eula', 'accept', '/noreboot', '/dynamicupdate', $(if ($Step.dynamicUpdate) { 'enable' } else { 'disable' }), '/showoobe', 'none', '/telemetry', 'disable', '/bitlocker', 'alwayssuspend', '/copylogs', "`"$logs`"")
+    if ($Step.ignoreCompat) { $sargs += @('/compat', 'ignorewarning') }
+    Write-Log "Running Windows setup: $setup $($sargs -join ' ')"
+    $r = Invoke-Process $setup $sargs 9000
+  } finally { Dismount-DiskImage -ImagePath $media -ErrorAction SilentlyContinue | Out-Null }
+  if ($r.timedOut) { throw (New-StepError 'TIMEOUT' "Windows setup didn't finish within 2.5 hours") }
+  if (@(0, 3, 3010) -notcontains $r.exitCode) {
+    $code = '0x{0:X8}' -f $r.exitCode
+    throw (New-StepError $code "Windows setup stopped with $code. Its logs are in $logs. $(Get-SetupError)")
+  }
+  return 'Windows setup has prepared the upgrade. It finishes during the next restart (30-90 minutes).'
+}
+# The last lines of Windows setup's error log, to explain a failed or rolled-back upgrade.
+function Get-SetupError {
+  foreach ($f in @("$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setuperr.log", "$env:SystemDrive\`$WINDOWS.~BT\Sources\Rollback\setuperr.log", "$env:WINDIR\Panther\setuperr.log")) {
+    if (Test-Path -LiteralPath $f) { return ((Get-Content -LiteralPath $f -Tail 3 -ErrorAction SilentlyContinue) -join ' ') -replace '\s+', ' ' }
+  }
+  return ''
+}
+
+# Runs a task sequence one step at a time. Progress is kept in the agent's state, so a sequence
+# carries on after the restarts its upgrade or restart steps need. Returns the deployment's new state.
+function Invoke-TaskSequence($Dep, $Prev, $Software) {
+  $ts = $Dep.taskSequence
+  $steps = @($ts.steps)
+  $n = $steps.Count
+  $now = Now-Ms
+  $build = Get-WindowsBuild
+  $st = @{ state = 'inprogress'; step = [int]$Prev.step; at = $now; stagedAt = $Prev.stagedAt; targetBuild = $Prev.targetBuild }
+  if ($ts.broken) { return @{ state = 'error'; code = 'TS_BROKEN'; message = "$($ts.broken). Edit the task sequence."; at = $now } }
+
+  # Waiting for a restart that an upgrade or a restart step asked for.
+  if ($Prev.state -eq 'staged' -or $Prev.state -eq 'restarting') {
+    if ((Get-BootMs) -le [int64]$Prev.stagedAt) {
+      # The deployment was changed to allow restarts after setup had prepared the upgrade.
+      if ($Prev.state -eq 'staged' -and $Dep.restart -eq 'Allow' -and -not $Prev.restartAsked) { Request-Restart 'to finish upgrading Windows'; $Prev.restartAsked = $true; $Prev.quiet = $true; return $Prev }
+      return $null # still waiting; nothing new to report
+    }
+    if ($Prev.state -eq 'staged' -and $Prev.targetBuild -and $build -lt [int]$Prev.targetBuild) {
+      # The assistant restarts more than once; give it a day before calling it a failure.
+      $busy = Get-Process -Name 'Windows10UpgraderApp', 'SetupHost' -ErrorAction SilentlyContinue
+      if ($busy -and ($now - [int64]$Prev.stagedAt) -lt 86400000) { return $null }
+      return @{ state = 'error'; code = 'ROLLBACK'; message = "Windows is still on build $build after restarting, so setup rolled the upgrade back. $(Get-SetupError)"; at = $now }
+    }
+    $st.step = [int]$Prev.step + 1
+  } elseif ($Prev.state -ne 'inprogress') { $st.step = 0 }
+
+  # Already on the version this sequence upgrades to.
+  if ($st.step -eq 0 -and $Dep.targetBuild -and $build -ge [int]$Dep.targetBuild) { return @{ state = 'success'; message = "Already on Windows build $build"; at = $now } }
+
+  for ($i = $st.step; $i -lt $n; $i++) {
+    $s = $steps[$i]
+    $label = "Step $($i + 1) of ${n}"
+    Send-Status $Dep.id 'inprogress' $null "${label}: $($s.type)"
+    Write-Log "Task sequence $($ts.name): $label ($($s.type))"
+    try {
+      switch ($s.type) {
+        'readiness' {
+          $p = @(Test-OsReadiness $s)
+          if ($p.Count) { return @{ state = 'reqnotmet'; code = 'NOT_READY'; message = "Not ready: $($p -join '; ')"; at = $now } }
+        }
+        'bitlocker' { Write-Log (Suspend-OsBitLocker) }
+        'script' {
+          $p = Invoke-PowerShellText $s.body 3600
+          if ($p.timedOut -or $p.exitCode -ne 0) { throw (New-StepError 'SCRIPT' "'$($s.name)' exited with $($p.exitCode). $(("$($p.output)" -split "`n" | Select-Object -Last 2) -join ' ')") }
+        }
+        'app' {
+          if (-not (Test-Detected $s.app.detectName $Software)) {
+            $r = Install-App @{ app = $s.app; action = 'Install' } $Software
+            $Software = Get-Software
+            if (-not $r.ok) { throw (New-StepError "$($r.code)" "$($s.app.name): $($r.message)") }
+            if (-not (Test-Detected $s.app.detectName $Software)) { throw (New-StepError 'NOT_DETECTED' "$($s.app.name) installed but wasn't detected") }
+          }
+        }
+        'restart' {
+          Request-Restart 'to continue setting up Windows'
+          return @{ state = 'restarting'; step = $i; stagedAt = Now-Ms; at = $now; message = "${label}: restarting" }
+        }
+        'upgrade' {
+          if ($build -ge [int]$s.image.build) { Write-Log "Already on build $build; skipping the upgrade"; break }
+          $msg = Invoke-OsUpgrade $s
+          if ($Dep.restart -eq 'Allow' -and $s.image.source -ne 'assistant') { Request-Restart 'to finish upgrading Windows' }
+          $wait = if ($Dep.restart -eq 'Allow' -or $s.image.source -eq 'assistant') { $msg } else { "$msg Waiting for the user to restart." }
+          return @{ state = 'staged'; step = $i; stagedAt = Now-Ms; targetBuild = [int]$s.image.build; restartAsked = ($Dep.restart -eq 'Allow'); at = $now; message = "${label}: $wait" }
+        }
+      }
+    } catch {
+      $code = if ($_.Exception.Data['code']) { $_.Exception.Data['code'] } else { 'ERROR' }
+      return @{ state = 'error'; code = $code; message = "${label} ($($s.type)): $($_.Exception.Message)"; at = $now }
+    }
+  }
+  $done = Get-WindowsBuild
+  return @{ state = 'success'; message = "Task sequence finished. Windows build $done."; at = $now }
 }
 
 # ---------------------------------------------------------------- one cycle
@@ -536,6 +953,9 @@ function Invoke-Cycle {
   $script:Config = To-Hash (Read-Json $ConfigPath)
   if (-not $script:Config.server -or -not $script:Config.token) { throw "Not installed. Run: ggt-agent.ps1 -Install -Server https://<site> -Token <token>" }
   $state = To-Hash (Read-Json $StatePath)
+  $script:State = $state
+  # The update server reports the updates PCs need about once an hour, or right after a change.
+  $script:WsusFull = [bool]$state.wsusForce -or -not $state.wsusAt -or ((Now-Ms) - [int64]$state.wsusAt) -gt 3600000
   $deps = To-Hash $state.deps
   $now = Now-Ms
   $errors = @(); $events = @($state.pendingEvents | Where-Object { $_ })
@@ -553,6 +973,8 @@ function Invoke-Cycle {
     catch { $errors += "Windows Update scan failed: $($_.Exception.Message)" }
   }
   $r = Invoke-Checkin $inv $sec $(if ($sendSw) { $sw } else { $null }) $upd $events $errors
+  if ($script:WsusFull -and $inv.wsus) { $state.wsusAt = $now; $state.wsusForce = $false }
+  $script:WsusFull = $false
   if ($sendSw) { $state.softwareHash = $swHash; $state.softwareAt = $now; $state.forceInventory = $false }
   $state.pendingEvents = @()
   $newEvents = @()
@@ -580,11 +1002,19 @@ function Invoke-Cycle {
         'vpnleave' { $res.output = Leave-Tailscale; $state.forceInventory = $true; $changed = $true }
         'ggvpnon' { $res.output = Connect-GoGreenVpn $c.vpn; $changed = $true }
         'ggvpnoff' { $res.output = Disconnect-GoGreenVpn; $changed = $true }
+        'encon' { $res.output = Enable-DiskEncryption; $changed = $true }
+        'encoff' { $res.output = Disable-DiskEncryption; $changed = $true }
+        'wsussetup' { $res.output = Install-WsusServer $c.wsus; $changed = $true }
+        'wsussync' { $res.output = Start-WsusSync; $changed = $true }
+        'wsusapprove' { $res.output = Set-WsusApproval $c.updates $true; $changed = $true }
+        'wsusdecline' { $res.output = Set-WsusApproval $c.updates $false; $changed = $true }
         default { $res = @{ status = 'failed'; exitCode = $null; output = "Unknown command $($c.type)" } }
       }
     } catch { $res = @{ status = 'failed'; exitCode = $null; output = $_.Exception.Message } }
     try { Invoke-Api 'POST' '/api/agent/result' @{ deviceId = $script:Config.deviceId; commandId = $c.id; status = $res.status; exitCode = $res.exitCode; output = "$($res.output)" } | Out-Null } catch { Write-Log $_.Exception.Message 'warn' }
   }
+
+  try { $wu = Set-WuClient "$($policy.wsusClient)" $state; if ($wu) { $newEvents += $wu; $changed = $true } } catch { $newEvents += "Couldn't set the update server: $($_.Exception.Message)" }
 
   if (@($policy.remediate).Count) {
     $rem = Invoke-Remediation @($policy.remediate) $policy.settings $sec
@@ -595,6 +1025,22 @@ function Invoke-Cycle {
   foreach ($d in @($policy.deployments)) {
     if (-not $d) { continue }
     $prev = To-Hash $deps[$d.id]
+    if ($d.kind -eq 'os') {
+      if ($prev.state -eq 'success' -or ($prev.state -eq 'reqnotmet' -and [int64]$prev.at -gt [int64]$d.retryAt -and ($now - [int64]$prev.at) -lt 86400000)) { continue }
+      $waiting = $prev.state -eq 'staged' -or $prev.state -eq 'restarting'
+      if (-not $waiting -and -not $d.allowedNow) { continue }
+      if ($prev.state -eq 'error' -and [int64]$prev.at -gt [int64]$d.retryAt -and ($now - [int64]$prev.at) -lt 86400000) { continue }
+      $res = Invoke-TaskSequence $d $prev $sw
+      if (-not $res) { continue }
+      if ($res.quiet) { $res.Remove('quiet'); $deps[$d.id] = $res; continue }
+      $deps[$d.id] = $res
+      $changed = $true
+      $sendState = if ($res.state -eq 'staged' -or $res.state -eq 'restarting') { 'inprogress' } else { $res.state }
+      Send-Status $d.id $sendState $(if ($res.state -eq 'error' -or $res.state -eq 'reqnotmet') { $res.code } else { $null }) $res.message
+      Write-Log "Task sequence $($d.name): $($res.state) $($res.message)"
+      $sw = Get-Software
+      continue
+    }
     if ($d.kind -eq 'app') {
       $want = $d.action -ne 'Uninstall'
       if ((Test-Detected $d.app.detectName $sw) -eq $want) {

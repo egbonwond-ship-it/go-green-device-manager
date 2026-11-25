@@ -4,26 +4,27 @@ import { openDevice } from './devices.js';
 
 const LABEL = Object.fromEntries(S.STATUS.map(([k, l]) => [k, l]));
 const KIND = { success: 'good', error: 'bad', inprogress: 'warn', reqnotmet: 'warn', unknown: 'neutral' };
-const targetName = d => (d.kind === 'app' ? S.app(d.targetId)?.name : S.byId('updateGroups', d.targetId)?.name) || 'deleted item';
+const targetName = d => (d.kind === 'app' ? S.app(d.targetId)?.name : d.kind === 'os' ? S.taskSequence(d.targetId)?.name : S.byId('updateGroups', d.targetId)?.name) || 'deleted item';
+const KIND_LABEL = { app: 'Application', updates: 'Software updates', os: 'Operating system' };
 
 export default function deployments(el, { params, rest }) {
   if (rest[0]) return detail(el, rest[0]);
-  el.innerHTML = `<div class="page-head"><div><h1>Deployments</h1><p class="muted">Applications and software updates sent to collections, with live results from each device.</p></div>
+  el.innerHTML = `<div class="page-head"><div><h1>Deployments</h1><p class="muted">Applications, software updates and Windows upgrades sent to collections, with live results from each device.</p></div>
     <div class="actions"><button class="btn primary" id="new">New deployment</button></div></div><div id="tbl"></div>
     <div class="st-legend" style="margin-top:8px">${S.STATUS.map(([, l, c]) => `<span style="--c:${c}">${l}</span>`).join('')}</div>`;
   const t = table(el.querySelector('#tbl'), {
     rows: () => S.state.deployments, search: d => `${d.name} ${targetName(d)}`, onRow: d => { location.hash = `#/deployments/${d.id}`; },
     empty: 'No deployments yet.',
     cols: [
-      { key: 'name', label: 'Deployment', render: d => `<b>${esc(d.name)}</b><div class="small muted">${d.kind === 'app' ? 'Application' : 'Software updates'} · ${esc(S.byId('collections', d.collectionId)?.name)}</div>` },
-      { key: 'action', label: 'Action', render: d => `${d.kind === 'app' ? d.action : 'Install updates'}${d.enabled ? '' : ' <span class="chip">disabled</span>'}` },
+      { key: 'name', label: 'Deployment', render: d => `<b>${esc(d.name)}</b><div class="small muted">${KIND_LABEL[d.kind] || d.kind} · ${esc(S.byId('collections', d.collectionId)?.name)}</div>` },
+      { key: 'action', label: 'Action', render: d => `${d.kind === 'app' ? d.action : d.kind === 'os' ? 'Run task sequence' : 'Install updates'}${d.enabled ? '' : ' <span class="chip">disabled</span>'}` },
       { key: 'status', label: 'Status', render: d => { const s = S.deploymentSummary(d); return `<div style="min-width:160px">${stackBar(s, S.STATUS)}<div class="small muted" style="margin-top:3px">${s.success}/${s.total} succeeded${s.error ? ` · <span style="color:var(--bad)">${s.error} errors</span>` : ''}</div></div>`; }, sort: d => S.deploymentSummary(d).pct },
       { key: 'pct', label: 'Success', num: true, render: d => S.deploymentSummary(d).pct + '%', sort: d => S.deploymentSummary(d).pct },
       { key: 'created', label: 'Created', render: d => fmtDate(d.created) },
     ],
   });
   el.querySelector('#new').addEventListener('click', () => wizard({}));
-  if (params.new) wizard({ app: params.app, c: params.c, ug: params.ug });
+  if (params.new) wizard({ app: params.app, c: params.c, ug: params.ug, ts: params.ts, kind: params.kind });
   return { refresh: () => t.draw() };
 }
 
@@ -32,12 +33,12 @@ function detail(el, id) {
   if (!dep) { el.innerHTML = '<p>Deployment not found. <a href="#/deployments">Back</a></p>'; return; }
   let filter = '';
   el.innerHTML = `<div class="page-head"><div><a class="small" href="#/deployments">← Deployments</a><h1>${esc(dep.name)}</h1>
-    <p class="muted">${dep.kind === 'app' ? `${dep.action} application` : 'Software update group'} <b>${esc(targetName(dep))}</b> to <a href="#/collections/${dep.collectionId}">${esc(S.byId('collections', dep.collectionId)?.name)}</a></p></div>
+    <p class="muted">${dep.kind === 'app' ? `${dep.action} application` : dep.kind === 'os' ? 'Task sequence' : 'Software update group'} <b>${esc(targetName(dep))}</b> to <a href="#/collections/${dep.collectionId}">${esc(S.byId('collections', dep.collectionId)?.name)}</a></p></div>
     <div class="actions"><button class="btn" id="toggle"></button><button class="btn" id="retry">Retry failed</button><button class="btn danger" id="del">Delete</button></div></div>
     <div class="stats" id="sum"></div>
     <div class="grid g2" style="margin-bottom:16px"><div class="card"><h3 style="margin-bottom:10px">Settings</h3><div class="kv">
       <div><span>Installs from</span><b>${fmtDate(dep.availableAt || dep.created)}</b></div><div><span>Maintenance windows</span><b>${dep.respectMW ? 'Respected' : 'Ignored'}</b></div>
-      <div><span>Restart</span><b>${dep.restart === 'Allow' ? 'Restart automatically when needed (5-minute warning)' : 'Don’t restart; flag the device as restart pending'}</b></div><div><span>Created by</span><b>${esc(dep.createdBy || '—')}</b></div></div></div>
+      <div><span>Restart</span><b>${dep.restart === 'Allow' ? 'Restart automatically when needed (5-minute warning)' : dep.kind === 'os' ? 'Don’t restart; the upgrade finishes when the user restarts' : 'Don’t restart; flag the device as restart pending'}</b></div><div><span>Created by</span><b>${esc(dep.createdBy || '—')}</b></div></div></div>
       <div class="card"><h3 style="margin-bottom:10px">Errors</h3><div id="errs"></div></div></div>
     <div id="tbl"></div>`;
   const t = table(el.querySelector('#tbl'), {
@@ -48,7 +49,7 @@ function detail(el, id) {
       { key: 'name', label: 'Device', render: d => `<span class="person">${statusDot(d)}<b>${esc(d.name)}</b></span>` },
       { key: 'site', label: 'Site' }, { key: 'os', label: 'OS' },
       { key: 's', label: 'Status', render: d => badge(LABEL[dep.results[d.id]], KIND[dep.results[d.id]]), sort: d => dep.results[d.id] },
-      { key: 'e', label: 'Detail', render: d => { const e = dep.errors[d.id]; const s = dep.results[d.id]; const msg = dep.messages[d.id]; return e ? `<span class="mono">${esc(e)}</span> <span class="small">${esc(S.ERRORS[e] || '')}${msg ? ` ${esc(msg)}` : ''}</span>` : s === 'reqnotmet' ? '<span class="small">This application has no install method for the device’s platform</span>' : s === 'unknown' && !d.online ? '<span class="small muted">Waiting for the device to come online</span>' : msg ? `<span class="small muted">${esc(msg)}</span>` : s === 'unknown' ? '<span class="small muted">Waiting for the next check-in</span>' : ''; } },
+      { key: 'e', label: 'Detail', render: d => { const e = dep.errors[d.id]; const s = dep.results[d.id]; const msg = dep.messages[d.id]; return e ? `<span class="mono">${esc(e)}</span> <span class="small">${esc(S.ERRORS[e] || '')}${msg ? ` ${esc(msg)}` : ''}</span>` : s === 'reqnotmet' ? `<span class="small">${esc(msg || 'This application has no install method for the device’s platform')}</span>` : s === 'unknown' && !d.online ? '<span class="small muted">Waiting for the device to come online</span>' : msg ? `<span class="small muted">${esc(msg)}</span>` : s === 'unknown' ? '<span class="small muted">Waiting for the next check-in</span>' : ''; } },
     ],
   });
   el.querySelector('#sf').addEventListener('change', e => { filter = e.target.value; t.draw(); });
@@ -68,9 +69,10 @@ function detail(el, id) {
 }
 
 export function wizard(pre) {
-  if (!S.state.apps.length && !S.state.updateGroups.length) { toast('Add an application to the software library or create an update group first.', true); return; }
-  const w = { step: 0, kind: pre.ug || !S.state.apps.length ? 'updates' : 'app', targetId: pre.app || pre.ug || '', collectionId: pre.c || '', action: 'Install', respectMW: true, restart: 'Suppress', availableAt: '', name: '' };
-  const firstTarget = () => (w.kind === 'app' ? S.state.apps[0]?.id : S.state.updateGroups[0]?.id) || '';
+  if (!S.state.apps.length && !S.state.updateGroups.length && !S.state.taskSequences.length) { toast('Add an application to the software library, create an update group or make a task sequence first.', true); return; }
+  const kind0 = pre.ts || pre.kind === 'os' ? 'os' : pre.ug || !S.state.apps.length ? (S.state.updateGroups.length ? 'updates' : 'os') : 'app';
+  const w = { step: 0, kind: kind0, targetId: pre.app || pre.ug || pre.ts || '', collectionId: pre.c || '', action: 'Install', respectMW: true, restart: 'Suppress', availableAt: '', name: '' };
+  const firstTarget = () => (w.kind === 'app' ? S.state.apps[0]?.id : w.kind === 'os' ? S.state.taskSequences[0]?.id : S.state.updateGroups[0]?.id) || '';
   if (!w.targetId) w.targetId = firstTarget();
   if (!w.collectionId) w.collectionId = 'c-all';
   const STEPS = ['Software', 'Collection', 'Settings', 'Review'];
@@ -81,10 +83,10 @@ export function wizard(pre) {
   const save = () => body.querySelectorAll('[data-w]').forEach(i => { w[i.dataset.w] = i.type === 'checkbox' ? i.checked : i.value; });
   const next = () => {
     save();
-    if (w.step === 0 && !w.targetId) { toast(w.kind === 'app' ? 'Add an application to the library first.' : 'Create an update group first.', true); return false; }
+    if (w.step === 0 && !w.targetId) { toast(w.kind === 'app' ? 'Add an application to the library first.' : w.kind === 'os' ? 'Make a task sequence on the Operating systems page first.' : 'Create an update group first.', true); return false; }
     if (w.step < 3) { w.step++; draw(); return false; }
     const dep = S.createDeployment({ kind: w.kind, targetId: w.targetId, collectionId: w.collectionId, action: w.kind === 'app' ? w.action : 'Install', respectMW: w.respectMW, restart: w.restart, availableAt: new Date(w.availableAt).getTime(), name: w.name.trim() });
-    toast('Deployment created. Devices pick it up at their next check-in.');
+    toast(w.kind === 'os' ? 'Deployment created. Each PC checks its hardware and starts at its next check-in; upgrades take 1–2 hours.' : 'Deployment created. Devices pick it up at their next check-in.');
     location.hash = `#/deployments/${dep.id}`;
   };
   const draw = () => {
@@ -95,28 +97,30 @@ export function wizard(pre) {
     const sel = (k, opts) => `<select data-w="${k}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${String(w[k]) === String(v) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
     let h = '';
     if (w.step === 0) {
-      h = `<div class="form-grid"><label class="field">What are you deploying?${sel('kind', [['app', 'Application'], ['updates', 'Software update group']])}</label>
-        <label class="field">${w.kind === 'app' ? 'Application' : 'Update group'}${sel('targetId', w.kind === 'app' ? S.state.apps.map(a => [a.id, `${a.name} ${a.version}`]) : S.state.updateGroups.map(g => [g.id, `${g.name} (${g.updateIds.length} updates)`]))}</label>
+      h = `<div class="form-grid"><label class="field">What are you deploying?${sel('kind', [['app', 'Application'], ['updates', 'Software update group'], ['os', 'Operating system (task sequence)']])}</label>
+        <label class="field">${w.kind === 'app' ? 'Application' : w.kind === 'os' ? 'Task sequence' : 'Update group'}${sel('targetId', w.kind === 'app' ? S.state.apps.map(a => [a.id, `${a.name} ${a.version}`]) : w.kind === 'os' ? S.state.taskSequences.map(t => [t.id, t.name]) : S.state.updateGroups.map(g => [g.id, `${g.name} (${g.updateIds.length} updates)`]))}</label>
+        ${w.kind === 'os' ? '<div class="notice info wide small">Windows 10 and 11 PCs run the task sequence in the background. Upgrades keep apps, files and settings, need a restart to finish and take 1–2 hours. Deploy to a small pilot collection first.</div>' : ''}
         ${w.kind === 'app' ? `<label class="field">Action${sel('action', [['Install', 'Install'], ['Uninstall', 'Uninstall']])}</label>` : ''}</div>`;
     } else if (w.step === 1) {
       h = `<div class="form-grid"><label class="field wide">Target collection${sel('collectionId', S.state.collections.map(c => [c.id, `${c.name} (${S.members(c.id).length} devices)`]))}</label></div>
         <div class="notice info" style="margin-top:12px">Tip: make a small pilot collection (for example devices tagged <span class="mono">pilot</span>), deploy there first, check results, then deploy to everyone.</div>`;
     } else if (w.step === 2) {
       h = `<div class="form-grid"><label class="field">Install from<input type="datetime-local" data-w="availableAt" value="${w.availableAt}"></label>
-        <label class="field">Restart behaviour${sel('restart', [['Suppress', 'Don’t restart; mark restart pending'], ['Allow', 'Restart when needed, with a 5-minute warning']])}</label>
+        <label class="field">Restart behaviour${sel('restart', w.kind === 'os' ? [['Suppress', 'Don’t restart; the upgrade finishes when the user restarts'], ['Allow', 'Restart when setup is ready, with a 5-minute warning']] : [['Suppress', 'Don’t restart; mark restart pending'], ['Allow', 'Restart when needed, with a 5-minute warning']])}</label>
         <label class="field check">Install only during maintenance windows<input type="checkbox" data-w="respectMW" ${w.respectMW ? 'checked' : ''}></label>
         <label class="field wide">Deployment name (optional)<input data-w="name" value="${esc(w.name)}" placeholder="Generated from the software and collection"></label></div>`;
     } else {
-      const target = w.kind === 'app' ? S.app(w.targetId) : S.byId('updateGroups', w.targetId);
+      const target = w.kind === 'app' ? S.app(w.targetId) : w.kind === 'os' ? S.taskSequence(w.targetId) : S.byId('updateGroups', w.targetId);
       const devs = S.members(w.collectionId);
       let notMet = 0, already = 0;
       if (w.kind === 'app') for (const d of devs) { if (!target.platforms.includes(d.platform)) notMet++; else if (d.installed.includes(target.id) === (w.action === 'Install')) already++; }
+      else if (w.kind === 'os') { const tb = S.tsTargetBuild(target); for (const d of devs) { if (S.osNotMet(d)) notMet++; else if (tb && S.buildNumber(d) >= tb) already++; } }
       else for (const d of devs) if (d.updatesScannedAt && !target.updateIds.some(u => d.missingUpdates.includes(u))) already++;
       const mws = S.state.maintenanceWindows.filter(x => x.collectionId === w.collectionId);
       h = `<div class="kv"><div><span>Software</span><b>${esc(target.name)}</b></div><div><span>Collection</span><b>${esc(S.byId('collections', w.collectionId).name)}</b></div>
-        <div><span>Action</span><b>${w.kind === 'app' ? w.action : 'Install updates'}</b></div><div><span>Installs from</span><b>${new Date(w.availableAt).toLocaleString('en-GB')}</b></div></div>
+        <div><span>Action</span><b>${w.kind === 'app' ? w.action : w.kind === 'os' ? 'Run task sequence' : 'Install updates'}</b></div><div><span>Installs from</span><b>${new Date(w.availableAt).toLocaleString('en-GB')}</b></div></div>
         <div class="stats" style="margin-top:16px"><div class="stat"><div class="stat-label">Targeted devices</div><div class="stat-value">${devs.length}</div></div>
-        <div class="stat"><div class="stat-label">Will install</div><div class="stat-value">${devs.length - notMet - already}</div></div>
+        <div class="stat"><div class="stat-label">${w.kind === 'os' ? 'Will run' : 'Will install'}</div><div class="stat-value">${devs.length - notMet - already}</div></div>
         <div class="stat"><div class="stat-label">Already compliant</div><div class="stat-value">${already}</div></div>
         <div class="stat"><div class="stat-label">Requirements not met</div><div class="stat-value">${notMet}</div></div></div>
         ${w.respectMW && mws.length ? `<div class="notice info">Maintenance window: ${mws.map(x => `${esc(x.name)} (${x.days} ${x.start}, ${x.hours} h)`).join('; ')}.</div>` : ''}

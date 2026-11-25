@@ -16,7 +16,7 @@ const REPORTS = [
     rows: () => S.state.apps.map(a => { const ds = S.state.devices.filter(d => d.installed.includes(a.id)); return [a.name, a.version, a.publisher, ds.length, ds.filter(d => d.platform === 'Windows').length, ds.filter(d => d.platform === 'macOS').length, ds.filter(d => d.platform === 'Linux').length]; }).sort((a, b) => b[3] - a[3]) },
   { id: 'dep', name: 'Deployment summary', desc: 'Success, error and in-progress counts for every deployment.',
     head: ['Deployment', 'Action', 'Created', 'Targeted', 'Success', 'In progress', 'Error', 'Requirements not met', 'Unknown', 'Success %'],
-    rows: () => S.state.deployments.map(d => { const s = S.deploymentSummary(d); return [d.name, d.kind === 'app' ? d.action : 'Install updates', fmtDay(d.created), s.total, s.success, s.inprogress, s.error, s.reqnotmet, s.unknown, s.pct + '%']; }) },
+    rows: () => S.state.deployments.map(d => { const s = S.deploymentSummary(d); return [d.name, d.kind === 'app' ? d.action : d.kind === 'os' ? 'Run task sequence' : 'Install updates', fmtDay(d.created), s.total, s.success, s.inprogress, s.error, s.reqnotmet, s.unknown, s.pct + '%']; }) },
   { id: 'hw', name: 'Hardware inventory', desc: 'Manufacturer, model, CPU, memory and storage of every device.',
     head: ['Device', 'Type', 'Manufacturer', 'Model', 'Serial', 'CPU', 'RAM GB', 'Disk GB', 'Disk free %'],
     rows: () => S.state.devices.map(d => [d.name, d.type, d.manufacturer, d.model, d.serial, d.cpu, d.ramGB, d.diskGB, d.diskFreePct]) },
@@ -26,9 +26,9 @@ const REPORTS = [
   { id: 'inactive', name: 'Inactive and unhealthy clients', desc: 'Devices that stopped reporting or whose agent needs repair.',
     head: ['Device', 'Site', 'Client health', 'Last seen', 'Agent version', 'Agent problems'],
     rows: () => S.state.devices.filter(d => d.health !== 'Healthy').map(d => [d.name, d.site, d.health, ago(d.lastSeen), d.agentVersion, d.agentErrors.join('; ')]) },
-  { id: 'win10', name: 'Windows 11 upgrade readiness', desc: 'Windows 10 devices (out of support since October 2025) and whether they have at least 8 GB of memory. Also check TPM 2.0 and CPU support.',
-    head: ['Device', 'User', 'Model', 'RAM GB', 'Ready'],
-    rows: () => S.state.devices.filter(d => d.osFamily === 'win10').map(d => [d.name, d.user || '', d.model, d.ramGB, d.ramGB >= 8 ? 'Yes' : 'No']) },
+  { id: 'win10', name: 'Windows 11 upgrade readiness', desc: 'Windows 10 devices (out of support since October 2025) and whether their hardware meets Windows 11’s requirements: TPM 2.0, UEFI, 4 GB memory, 64 GB disk. Windows setup checks the processor during the upgrade. Upgrade them from Operating systems.',
+    head: ['Device', 'User', 'Model', 'RAM GB', 'TPM', 'Secure Boot', 'Ready', 'Blocking'],
+    rows: () => S.state.devices.filter(d => d.osFamily === 'win10').map(d => { const r = S.win11Readiness(d); return [d.name, d.user || '', d.model, d.ramGB, d.osReady?.tpm ?? '', d.osReady?.secureBoot == null ? '' : d.osReady.secureBoot ? 'On' : 'Off', r.ready === null ? 'Unknown' : r.ready ? 'Yes' : 'No', r.problems.join('; ')]; }) },
 ];
 
 export default function reports(el, { params }) {

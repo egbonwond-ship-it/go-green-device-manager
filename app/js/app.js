@@ -13,11 +13,13 @@ import reports from './views/reports.js';
 import settings from './views/settings.js';
 import remote from './views/remote.js';
 import vpn from './views/vpn.js';
+import osd from './views/osd.js';
+import encryption from './views/encryption.js';
 
 const NAV = [
   ['Estate', [['overview', 'Overview', '◎', overview], ['devices', 'Devices', '▣', devices], ['collections', 'Collections', '⧉', collections]]],
-  ['Deliver', [['library', 'Software library', '⬚', library], ['deployments', 'Deployments', '➜', deployments], ['updates', 'Software updates', '⟳', updates], ['remote', 'Remote desktop', '▭', remote], ['vpn', 'VPN', '⛨', vpn]]],
-  ['Protect', [['compliance', 'Compliance', '✓', compliance], ['monitoring', 'Monitoring & alerts', '♥', monitoring], ['scripts', 'Run scripts', '›_', scripts]]],
+  ['Deliver', [['library', 'Software library', '⬚', library], ['deployments', 'Deployments', '➜', deployments], ['updates', 'Software updates', '⟳', updates], ['osd', 'Operating systems', '⊞', osd], ['remote', 'Remote desktop', '▭', remote], ['vpn', 'VPN', '⛨', vpn]]],
+  ['Protect', [['compliance', 'Compliance', '✓', compliance], ['encryption', 'Disk encryption', '⚿', encryption], ['monitoring', 'Monitoring & alerts', '♥', monitoring], ['scripts', 'Run scripts', '›_', scripts]]],
   ['Insight', [['reports', 'Reports', '▤', reports], ['settings', 'Administration', '⚙', settings]]],
 ];
 const PAGES = Object.fromEntries(NAV.flatMap(([, items]) => items.map(([id, label, , mod]) => [id, { label, mod }])));
@@ -80,6 +82,8 @@ document.head.append(style);
 let current = null;
 function route() {
   const [path, qs] = (location.hash.replace(/^#\/?/, '') || 'overview').split('?');
+  // The update server used to be its own page; it is now a tab of Software updates.
+  if (path === 'wsus') { location.replace(`#/updates?tab=server${qs ? '&' + qs.replace(/(^|&)tab=/, '$1sub=') : ''}`); return; }
   const [id, ...rest] = path.split('/');
   const page = PAGES[id] || PAGES.overview;
   const params = Object.fromEntries(new URLSearchParams(qs || ''));

@@ -54,6 +54,24 @@ module.exports = {
       },
     },
   ],
+  // Windows images and task sequences added once to every console, like the apps above.
+  osImages: [
+    {
+      id: 'os-win11-latest', name: 'Windows 11, latest release (from Microsoft)', version: '25H2 or later', build: 26200, architecture: 'x64', source: 'assistant', builtIn: true,
+      notes: 'Microsoft’s Windows 11 Installation Assistant downloads and installs the newest Windows 11 release, keeping apps, files and settings. Nothing to host. Microsoft decides the exact version, and the assistant restarts the PC itself when it’s ready. For a fixed version, add an ISO image instead.',
+    },
+  ],
+  taskSequences: [
+    {
+      id: 'ts-win11-upgrade', name: 'Upgrade to Windows 11', builtIn: true,
+      description: 'Checks the PC meets Windows 11’s requirements, suspends BitLocker so the PC restarts without asking for the recovery key, then upgrades in place. Apps, files and settings stay.',
+      steps: [
+        { type: 'readiness', win11: true, minFreeGB: 25 },
+        { type: 'bitlocker' },
+        { type: 'upgrade', imageId: 'os-win11-latest', dynamicUpdate: true, ignoreCompat: false },
+      ],
+    },
+  ],
   scripts: [
     { id: 'disk', name: 'Get disk usage', lang: 'PowerShell', builtIn: true, body: 'Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystemLabel, @{n="FreeGB";e={[math]::Round($_.SizeRemaining/1GB,1)}}, @{n="SizeGB";e={[math]::Round($_.Size/1GB,1)}} | Format-Table -AutoSize | Out-String -Width 200' },
     { id: 'temp', name: 'Clear temp files', lang: 'PowerShell', builtIn: true, body: '$before = (Get-PSDrive C).Free\nRemove-Item "$env:WINDIR\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue\nGet-ChildItem C:\\Users -Directory | ForEach-Object { Remove-Item "$($_.FullName)\\AppData\\Local\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue }\n"Freed {0:N2} GB" -f (((Get-PSDrive C).Free - $before) / 1GB)' },

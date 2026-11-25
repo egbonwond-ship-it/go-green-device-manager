@@ -1,14 +1,16 @@
 import * as S from '../store.js';
 import { esc, fmtN, table, modal, toast, badge, fmtDay, fmtDate, size, drawer, statusDot, confirmBox } from '../ui.js';
 import { openDevice } from './devices.js';
+import { serverPanel } from './wsus.js';
 
 const CLASSES = ['Security Updates', 'Critical Updates', 'Definition Updates', 'Update Rollups', 'Updates', 'Feature Packs', 'Drivers', 'Upgrades', 'macOS', 'Linux packages'];
 const SEVS = ['Critical', 'Important', 'Moderate', 'Low'];
 
 export default function updates(el, { params }) {
   let tab = params.tab || 'all';
-  const TABS = [['all', 'All updates'], ['groups', 'Update groups'], ['adr', 'Automatic deployment rules']];
-  el.innerHTML = `<div class="page-head"><div><h1>Software updates</h1><p class="muted">Windows, macOS and Linux updates each device’s agent found when it scanned: what each device needs, grouped and deployed in rings.</p></div>
+  const TABS = [['all', 'All updates'], ['groups', 'Update groups'], ['adr', 'Automatic deployment rules'], ['server', 'Local update server (WSUS)']];
+  if (!TABS.some(([k]) => k === tab)) tab = 'all';
+  el.innerHTML = `<div class="page-head"><div><h1>Software updates</h1><p class="muted">Windows, macOS and Linux updates each device’s agent found when it scanned: what each device needs, grouped and deployed in rings. The Local update server tab runs Windows Update Manager, a WSUS server that downloads Windows updates from Microsoft once for your whole network.</p></div>
     <div class="actions"><button class="btn" id="adrnew">New automatic rule</button><button class="btn primary" id="grp">Create update group</button></div></div>
     <div class="stats" id="st"></div><div class="tabs">${TABS.map(([k, l]) => `<button data-tab="${k}" aria-selected="${k === tab}">${l}</button>`).join('')}</div><div id="body"></div>`;
   let sel = new Set();
@@ -29,8 +31,13 @@ export default function updates(el, { params }) {
     const b = el.querySelector('#body');
     el.querySelector('#grp').style.display = tab === 'all' ? '' : 'none';
     el.querySelector('#adrnew').style.display = tab === 'adr' ? '' : 'none';
+    el.querySelector('#st').style.display = tab === 'server' ? 'none' : '';
     b.onclick = null;
-    if (tab === 'all') {
+    b.onchange = null;
+    if (tab === 'server') {
+      const p = serverPanel(b, tab === params.tab ? params : {});
+      cur = { draw: p.refresh };
+    } else if (tab === 'all') {
       cur = table(b, {
         rows: () => S.updateList(), search: u => `${u.kb} ${u.title} ${u.product} ${u.classification}`, onRow: u => openUpdate(u.id),
         empty: 'No updates reported yet. Agents scan for updates every 6 hours and when you choose “Scan for updates” on a device.',

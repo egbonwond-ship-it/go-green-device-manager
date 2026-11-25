@@ -250,6 +250,147 @@ const call = (method, p, body, headers = ADMIN, query = {}) => handle({ method, 
   assert.equal(M.inCidr('10.20.5.5', '10.20.0.0/16'), true); assert.equal(M.inCidr('10.21.5.5', '10.20.0.0/16'), false);
   console.log('✓ console and server collection rules agree');
 
+  // ---------- Windows OS deployment: images, task sequences, policy
+  {
+    useStore(memoryStore());
+    let st = (await call('GET', '/api/console/state')).body;
+    assert.ok(st.osImages.some(i => i.id === 'os-win11-latest' && i.source === 'assistant' && i.build === 26200), 'built-in Windows 11 image');
+    const ts0 = st.taskSequences.find(t => t.id === 'ts-win11-upgrade');
+    assert.deepEqual(ts0.steps.map(x => x.type), ['readiness', 'bitlocker', 'upgrade'], 'built-in upgrade task sequence');
+    const put = (kind, doc) => call('PUT', `/api/console/objects/${kind}/${doc.id}`, { doc });
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'usb', build: 26100 })).status, 400, 'image source checked');
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'iso', build: 26100, url: 'http://x/win.iso' })).status, 400, 'ISO must be https or a share');
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'iso', build: 99, url: 'https://x/win.iso' })).status, 400, 'build checked');
+    assert.equal((await put('osImage', { id: 'img1', name: 'Bad', source: 'iso', build: 26100, url: 'https://x/win.iso', sha256: 'abc' })).status, 400, 'SHA-256 checked');
+    assert.equal((await put('osImage', { id: 'img-share', name: 'Share', source: 'iso', build: '26100', url: '\\\\GODC01\\Images\\Win11.iso' })).status, 200, 'network share accepted');
+    r = await put('osImage', { id: 'img1', name: 'Windows 11 Pro 24H2', source: 'iso', build: 26100, architecture: 'x64', url: 'https://files.example.com/Win11_24H2.iso', sha256: 'A'.repeat(64) });
+    assert.equal(r.status, 200); assert.equal(r.body.doc.build, 26100);
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Empty', steps: [] })).status, 400, 'steps required');
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Bad', steps: [{ type: 'format-disk' }] })).status, 400, 'step types checked');
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Bad', steps: [{ type: 'upgrade' }] })).status, 400, 'upgrade needs an image');
+    await put('app', { id: 'app-7z', name: '7-Zip', version: '24', detectName: '7-Zip', platforms: ['Windows'], windows: { wingetId: '7zip.7zip' } });
+    assert.equal((await put('taskSequence', { id: 'ts1', name: 'Finance to 24H2', steps: [{ type: 'readiness', win11: true, minFreeGB: 30 }, { type: 'script', scriptId: 'gpupdate' }, { type: 'upgrade', imageId: 'img1', dynamicUpdate: false }, { type: 'app', appId: 'app-7z' }, { type: 'restart' }] })).status, 200);
+    await put('deployment', { id: 'dep-os', name: 'Win11', kind: 'os', targetId: 'ts1', collectionId: 'c-all', enabled: true, respectMW: false, restart: 'Allow' });
+    assert.equal((await call('DELETE', '/api/console/objects/osImage/img1')).status, 409, 'images used by task sequences cannot be deleted');
+    assert.equal((await call('DELETE', '/api/console/objects/taskSequence/ts1')).status, 409, 'deployed task sequences cannot be deleted');
+    assert.equal((await call('DELETE', '/api/console/objects/script/gpupdate')).status, 409, 'scripts used by task sequences cannot be deleted');
+
+    const H2 = { 'x-ggt-enroll-token': 'test-token' };
+    const win = { name: 'GGT-W10-01', platform: 'Windows', os: 'Windows 10 Pro 22H2', build: '19045.5131', type: 'Desktop', serial: 'W10', ip: '10.1.1.1', agentVersion: '2.4.0', ramGB: 8, diskGB: 256,
+      osReady: { tpm: '2.0', secureBoot: true, uefi: true, arch: 'x64', diskFreeGB: 120, junk: 'x' }, security: {} };
+    r = await call('POST', '/api/agent/checkin', win, H2);
+    const wk = { ...H2, 'x-ggt-device-key': r.body.deviceKey }, wid = r.body.deviceId;
+    const old = await call('POST', '/api/agent/checkin', { ...win, name: 'GGT-OLD', serial: 'OLD', agentVersion: '2.3.0' }, H2);
+    const srv = await call('POST', '/api/agent/checkin', { ...win, name: 'GGT-SRV', serial: 'SRV', os: 'Windows Server 2022 Standard', type: 'Server' }, H2);
+    let pol = (await call('GET', '/api/agent/policy', null, wk, { deviceId: wid })).body;
+    const od = pol.deployments.find(x => x.id === 'dep-os');
+    assert.equal(od.kind, 'os'); assert.equal(od.targetBuild, 26100); assert.equal(od.restart, 'Allow');
+    assert.deepEqual(od.taskSequence.steps.map(x => x.type), ['readiness', 'script', 'upgrade', 'app', 'restart']);
+    assert.equal(od.taskSequence.steps[1].body, 'gpupdate /force', 'script body sent');
+    assert.equal(od.taskSequence.steps[2].image.url, 'https://files.example.com/Win11_24H2.iso', 'image sent');
+    assert.equal(od.taskSequence.steps[2].dynamicUpdate, false);
+    assert.equal(od.taskSequence.steps[3].app.wingetId, '7zip.7zip', 'app step resolved for Windows');
+    assert.equal(od.taskSequence.broken, null);
+    for (const [who, label] of [[old, 'agents before 2.4.0'], [srv, 'Windows Server']]) {
+      const k = { ...H2, 'x-ggt-device-key': who.body.deviceKey };
+      assert.ok(!(await call('GET', '/api/agent/policy', null, k, { deviceId: who.body.deviceId })).body.deployments.some(x => x.kind === 'os'), `no task sequences for ${label}`);
+    }
+    process.env.OSD_ALLOW_SERVER = '1';
+    assert.ok((await call('GET', '/api/agent/policy', null, { ...H2, 'x-ggt-device-key': srv.body.deviceKey }, { deviceId: srv.body.deviceId })).body.deployments.some(x => x.kind === 'os'), 'OSD_ALLOW_SERVER lets the CI test run on Windows Server');
+    assert.ok(!(await call('GET', '/api/agent/policy', null, { ...H2, 'x-ggt-device-key': old.body.deviceKey }, { deviceId: old.body.deviceId })).body.deployments.some(x => x.kind === 'os'), 'but never old agents');
+    delete process.env.OSD_ALLOW_SERVER;
+    assert.equal((await call('POST', '/api/agent/status', { deviceId: wid, deploymentId: 'dep-os', state: 'reqnotmet', errorCode: 'NOT_READY', message: 'Not ready: no TPM' }, wk)).status, 202);
+    st = (await call('GET', '/api/console/state')).body;
+    const dv = st.devices.find(d => d.id === wid);
+    assert.deepEqual(dv.osReady, { tpm: '2.0', secureBoot: true, uefi: true, arch: 'x64', diskFreeGB: 120 }, 'readiness stored without extra fields');
+    // The console marks results with the same rules as the server.
+    const S = await import(pathToFileURL(path.join(__dirname, '../app/js/store.js')));
+    for (const d of st.devices) assert.equal(S.osNotMet(d), M.osNotMet(d), `${d.name}: console and server agree on who can run task sequences`);
+    assert.equal(S.win11Readiness(dv).ready, true);
+    assert.deepEqual(S.win11Readiness({ ...dv, osReady: { tpm: '1.2', uefi: false, arch: 'x64' } }).problems, ['TPM 1.2', 'Legacy BIOS']);
+    assert.equal(S.win11Readiness({ ...dv, osReady: null }).ready, null);
+    console.log('✓ OS deployment: images, task sequences, checks, policy, agent version and Server excluded, readiness');
+  }
+
+  // ---------- disk encryption: status, on/off commands, recovery keys
+  {
+    useStore(memoryStore());
+    await call('GET', '/api/console/state');
+    const H3 = { 'x-ggt-enroll-token': 'test-token' };
+    const base = { platform: 'Windows', os: 'Windows 11 Pro 24H2', build: '26100', type: 'Laptop', security: { encrypted: false } };
+    const enrol = async (name, extra = {}) => { const x = await call('POST', '/api/agent/checkin', { ...base, name, serial: name, ...extra }, H3); return { id: x.body.deviceId, h: { ...H3, 'x-ggt-device-key': x.body.deviceKey } }; };
+    const w = await enrol('GGT-ENC-W1', { encryption: { kind: 'BitLocker', status: 'encrypting', percent: 42, method: 'XTS-AES 256', protectors: ['TPM', 'Recovery password'], available: true, extra: 1 } });
+    const mac = await enrol('GGT-ENC-M1', { platform: 'macOS', os: 'macOS 15.1', encryption: { kind: 'FileVault', status: 'off', available: true } });
+    const lin = await enrol('GGT-ENC-L1', { platform: 'Linux', os: 'Ubuntu 24.04', encryption: { kind: 'LUKS', status: 'nonsense' } });
+    r = await call('POST', '/api/console/commands', { type: 'encon', deviceIds: [w.id, mac.id, lin.id] });
+    assert.deepEqual(r.body.commands.map(c => c.status), ['queued', 'queued', 'skipped'], 'turn on: Windows and Mac, not Linux');
+    r = await call('POST', '/api/console/commands', { type: 'encoff', deviceIds: [w.id, mac.id] });
+    assert.deepEqual(r.body.commands.map(c => c.status), ['queued', 'skipped'], 'turn off: Windows only');
+    assert.ok((await call('GET', '/api/agent/policy', null, w.h, { deviceId: w.id })).body.commands.some(c => c.type === 'encon'), 'command delivered');
+    const BL = '123456-234567-345678-456789-567890-678901-789012-890123';
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: w.id, keys: [{ kind: 'BitLocker', keyId: '{A}', password: 'not-a-key' }] }, w.h)).status, 400, 'recovery key format checked');
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: w.id, keys: [{ kind: 'BitLocker', keyId: '{A}', password: BL }] }, mac.h)).status, 403, 'a device can only save its own key');
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: w.id, keys: [{ kind: 'BitLocker', keyId: '{A}', volume: 'C:', password: BL }] }, w.h)).status, 202);
+    assert.equal((await call('POST', '/api/agent/escrow', { deviceId: mac.id, keys: [{ kind: 'FileVault', keyId: 'fv1', password: 'ABCD-EFGH-IJKL-MNOP-QRST-UVWX' }] }, mac.h)).status, 202);
+    const st = (await call('GET', '/api/console/state')).body;
+    assert.ok(!JSON.stringify(st).includes(BL), 'recovery keys never appear in the console state');
+    assert.equal(st.recoveryKeys.filter(k => k.deviceId === w.id).length, 1, 'console knows a key is saved');
+    const dv = st.devices.find(d => d.id === w.id);
+    assert.deepEqual(dv.encryption, { kind: 'BitLocker', status: 'encrypting', percent: 42, method: 'XTS-AES 256', protectors: ['TPM', 'Recovery password'], available: true, note: null });
+    assert.equal(st.devices.find(d => d.id === lin.id).encryption.status, null, 'unknown status dropped');
+    assert.equal((await call('GET', `/api/console/devices/${w.id}/recovery-keys`, null, who('stranger'))).status, 403, 'non-admins cannot read keys');
+    r = await call('GET', `/api/console/devices/${w.id}/recovery-keys`);
+    assert.equal(r.body.keys[0].password, BL);
+    assert.ok((await call('GET', '/api/console/state')).body.log.some(l => /Viewed the recovery key of GGT-ENC-W1/.test(l.message) && l.by === 'admin-user'), 'viewing a key is logged');
+    console.log('✓ disk encryption: status, on/off per platform, recovery keys saved, hidden and logged');
+  }
+
+  // ---------- local update server (WSUS)
+  {
+    useStore(memoryStore());
+    await call('GET', '/api/console/state');
+    const H4 = { 'x-ggt-enroll-token': 'test-token' };
+    const enrol = async (name, extra = {}) => { const x = await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows 11 Pro 24H2', build: '26100', type: 'Laptop', security: {}, name, serial: name, ...extra }, H4); return { id: x.body.deviceId, h: { ...H4, 'x-ggt-device-key': x.body.deviceKey } }; };
+    const srv = await enrol('GGT-WSUS01', { os: 'Windows Server 2022 Standard', type: 'VM', fqdn: 'ggt-wsus01.go-greentechnologies.com' });
+    const pc = await enrol('GGT-PC01');
+    const put = doc => call('PUT', '/api/console/objects/updateServer/main', { doc: { id: 'main', ...doc } });
+    const good = { deviceId: srv.id, products: ['Windows 11'], classifications: ['Security Updates'], clientCollectionId: 'c-wks' };
+    assert.equal((await put({ ...good, products: ['Windows 95'] })).status, 400, 'products checked');
+    assert.equal((await put({ ...good, contentDir: '\\\\share\\x' })).status, 400, 'local folder only');
+    assert.equal((await call('PUT', '/api/console/objects/updateServer/other', { doc: { id: 'other', ...good } })).status, 400, 'one update server');
+    r = await put(good);
+    assert.equal(r.status, 200); assert.equal(r.body.doc.port, 8530); assert.equal(r.body.doc.contentDir, 'C:\\WSUS'); assert.equal(r.body.doc.syncTime, '02:00');
+    let pol = (await call('GET', '/api/agent/policy', null, pc.h, { deviceId: pc.id })).body;
+    assert.equal(pol.wsusClient, 'http://ggt-wsus01.go-greentechnologies.com:8530', 'workstations pointed at the server by its name');
+    pol = (await call('GET', '/api/agent/policy', null, srv.h, { deviceId: srv.id })).body;
+    assert.equal(pol.wsusClient, null, 'the server itself is left alone');
+    assert.equal((await call('POST', '/api/console/commands', { type: 'wsussetup', deviceIds: [pc.id] })).status, 400, 'server actions only go to the server');
+    r = await call('POST', '/api/console/commands', { type: 'wsussetup', deviceIds: [srv.id] });
+    assert.equal(r.body.commands[0].status, 'queued');
+    assert.equal((await call('POST', '/api/console/commands', { type: 'wsusapprove', deviceIds: [srv.id], updates: ['nope'] })).status, 400, 'update IDs checked');
+    const U = '0b8a1e4c-5f6d-4a3b-9c2d-1e0f9a8b7c6d';
+    await call('POST', '/api/console/commands', { type: 'wsusapprove', deviceIds: [srv.id], updates: [U] });
+    pol = (await call('GET', '/api/agent/policy', null, srv.h, { deviceId: srv.id })).body;
+    assert.equal(pol.commands.find(c => c.type === 'wsussetup').wsus.products[0], 'Windows 11', 'settings travel with the setup command');
+    assert.deepEqual(pol.commands.find(c => c.type === 'wsusapprove').updates, [U]);
+    // The server reports its state; the list of needed updates is kept between hourly reports.
+    const wsus = { installed: true, port: 8530, lastSync: new Date().toISOString(), lastSyncResult: 'Succeeded', syncing: false, computers: 3, updates: [{ id: U, kb: 'KB5046617', title: 'Cumulative update', classification: 'Security Updates', severity: 'Critical', needed: 3, installed: 1, approved: false }] };
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows Server 2022 Standard', type: 'VM', security: {}, name: 'GGT-WSUS01', deviceId: srv.id, wsus }, srv.h);
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows Server 2022 Standard', type: 'VM', security: {}, name: 'GGT-WSUS01', deviceId: srv.id, wsus: { ...wsus, updates: undefined, syncing: true } }, srv.h);
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows 11 Pro 24H2', type: 'Laptop', security: {}, name: 'GGT-PC01', deviceId: pc.id, wuServer: 'http://ggt-wsus01.go-greentechnologies.com:8530' }, pc.h);
+    let st = (await call('GET', '/api/console/state')).body;
+    const sv = st.devices.find(d => d.id === srv.id);
+    assert.equal(sv.wsus.syncing, true); assert.equal(sv.wsus.updates[0].kb, 'KB5046617', 'needed updates kept between reports');
+    assert.equal(st.devices.find(d => d.id === pc.id).wuServer, 'http://ggt-wsus01.go-greentechnologies.com:8530');
+    await call('POST', '/api/agent/checkin', { platform: 'Windows', os: 'Windows Server 2022 Standard', type: 'VM', security: {}, name: 'GGT-WSUS01', deviceId: srv.id }, srv.h);
+    st = (await call('GET', '/api/console/state')).body;
+    assert.equal(st.devices.find(d => d.id === srv.id).wsus.updates.length, 1, 'an older agent that sends nothing keeps the last report');
+    assert.equal((await call('DELETE', '/api/console/objects/collection/c-wks')).status, 409);
+    await put({ ...good, url: 'http://wsus.lab:8530' });
+    assert.equal((await call('GET', '/api/agent/policy', null, pc.h, { deviceId: pc.id })).body.wsusClient, 'http://wsus.lab:8530', 'address override');
+    console.log('✓ update server: settings checked, PCs pointed at it, server-only actions, status kept between reports');
+  }
+
   // ---------- storage outage
   useStore({ kind: 'broken', countDevices: async () => { throw new Error('down'); }, getDevice: async () => { throw new Error('down'); } });
   assert.equal((await call('GET', '/api/health', null, {})).status, 503);
