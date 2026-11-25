@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-AGENT_VERSION = '2.5.1'
+AGENT_VERSION = '2.5.2'
 IS_MAC = sys.platform == 'darwin'
 OK_TYPES = ('Laptop', 'Desktop', 'Server', 'VM')
 
@@ -226,7 +226,8 @@ def join_tailscale(key):
         exe = find_tailscale()
     if not exe:
         raise RuntimeError('Tailscale is not installed. Install the standalone Tailscale app for macOS (from pkgs.tailscale.com or the Software library), then try again.')
-    code, text = sh([exe, 'up', '--authkey=' + key, '--hostname=' + socket.gethostname().split('.')[0].lower()], timeout=180)
+    # --accept-dns=false keeps the device's own DNS (Tailscale's would replace it and break domain name lookups).
+    code, text = sh([exe, 'up', '--reset', '--authkey=' + key, '--accept-dns=false', '--hostname=' + socket.gethostname().split('.')[0].lower()], timeout=180)
     if code != 0:
         raise RuntimeError('tailscale up failed: %s' % text.replace(key, 'tskey-…')[-500:])
     # Only report success once Tailscale shows an address for this device.
